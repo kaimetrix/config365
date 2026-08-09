@@ -1,0 +1,6 @@
+{
+  "pathPrefix": "enterprise-apps/",
+  "fields": [
+    "servicePrincipalId"
+  ]
+}

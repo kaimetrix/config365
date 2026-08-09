@@ -1,0 +1,18 @@
+{
+  "pathPrefix": "exchange/",
+  "fields": [
+    "Guid", "ImmutableId", "Id", "Identity", "DistinguishedName", "OrganizationId",
+    "WhenChanged", "WhenCreated", "WhenChangedUTC", "WhenCreatedUTC",
+    "CreatedBy", "LastModifiedBy", "ModifiedBy", "ManuallyModified",
+    "RuleVersion", "Size", "RegexSize",
+    "ObjectState", "ObjectCategory", "ObjectClass",
+    "ExchangeVersion", "AdminDisplayVersion", "AdminDisplayName",
+    "IsValid", "IsDefault", "IsRuleConfigurationSupported", "RuleConfigurationUnsupportedReason",
+    "ActivationDate", "ExpiryDate",
+    "_PolicyType", "_PolicyName", "Name",
+    "Actions", "Conditions", "Exceptions", "Description",
+    "DlpPolicyId", "DlpPolicy", "RuleSubType",
+    "Priority", "RecommendedPolicyType",
+    "ExchangeObjectId", "OrganizationalUnitRoot", "OriginatingServer"
+  ]
+}

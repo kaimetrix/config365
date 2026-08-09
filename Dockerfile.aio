@@ -1,0 +1,368 @@
+# ─── Config365 — All-in-One Production Image ────────────────────────────────
+# Bundles the Node.js portal, Gitea binary, and act_runner into a single image
+# managed by supervisord. Designed for Azure Container Apps / App Service.
+#
+# Local development — use Docker Compose only (do not docker run manually):
+#   cp .env.example .env
+#   docker compose up -d --build
+#   → http://localhost:8080  (PORTAL_HTTP_PORT in .env, default 8080)
+#
+# Production: push to Azure Container Registry and deploy via Azure Container Apps.
+
+# ─── Stage 1: Build the Next.js portal ───────────────────────────────────────
+FROM node:22-bookworm-slim AS portal-build
+
+# Build tools required by better-sqlite3 native module
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY portal-next/package*.json ./
+RUN npm ci
+
+# CACHE_BUST_PORTAL: bump this to force a full portal rebuild without --no-cache.
+# Useful when TypeScript source changes don't trigger a Docker layer invalidation.
+ARG CACHE_BUST_PORTAL=6
+RUN echo "portal cache bust: $CACHE_BUST_PORTAL"
+
+COPY portal-next/ .
+
+# Inject the canonical field-exclusion configs from runner/scripts/ so TypeScript
+# can statically import them at build time. These overwrite the mirrored copies in
+# portal-next/lib/compare-ignore-fields/ to ensure the Docker build is always driven
+# by the runner/scripts/ source of truth.
+COPY runner/scripts/compare-ignore-fields/ ./lib/compare-ignore-fields/
+
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# Build the standalone token-api-server (separate entry point, not part of Next.js bundle).
+# better-sqlite3 and mssql must stay external:
+#   - better-sqlite3: native .node bindings cannot be bundled
+#   - mssql/tedious: use dynamic require("net") etc.; esbuild ESM bundles break that
+#     with "Dynamic require of \"net\" is not supported" at runtime.
+# Azure SDK packages are also external (installed into /app/node_modules in the runtime stage).
+# server-only is shimmed: its guard is irrelevant outside a Next.js server context.
+RUN npx esbuild token-api-server.ts \
+      --bundle --platform=node --format=esm \
+      --external:better-sqlite3 --external:mssql \
+      --external:@azure/identity --external:@azure/keyvault-secrets --external:@azure/storage-blob \
+      --alias:server-only=./server-only-shim.js \
+      --outfile=token-api-server.mjs
+
+RUN npx esbuild run-migrations.ts \
+      --bundle --platform=node --format=esm \
+      --external:better-sqlite3 --external:mssql \
+      --alias:server-only=./server-only-shim.js \
+      --outfile=run-migrations.mjs
+
+# ─── Stage 2: Rebuild intunewin with patched Go stdlib ───────────────────────
+# Upstream v0.0.5 ships with Go 1.25.3 (CRITICAL/HIGH stdlib CVEs). No newer
+# release exists, so rebuild the same tag with Go 1.26.5 for Trivy-fixed stdlib.
+FROM golang:1.26.5-bookworm AS intunewin-build
+ARG INTUNEWIN_VERSION=0.0.5
+WORKDIR /src
+RUN git clone --depth 1 --branch "v${INTUNEWIN_VERSION}" https://github.com/kenchan0130/intunewin.git . \
+ && CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w -X main.version=${INTUNEWIN_VERSION}" \
+      -o /out/intunewin ./cmd/intunewin
+
+# ─── Stage 3: All-in-One runtime image ───────────────────────────────────────
+# Start from the PowerShell image so PS + M365 modules are already layered in.
+FROM mcr.microsoft.com/powershell:7.4-ubuntu-22.04
+
+# VERSION is EPOCH.PLATFORM.APP (e.g. 1.2.10) — PLATFORM_VERSION here is the 2nd
+# digit, passed in as a build-arg by the release workflow (parsed from VERSION).
+# Default 1 matches an unbumped VERSION (x.1.x) for local `docker compose build`.
+ARG PLATFORM_VERSION=1
+ENV CONFIG365_PLATFORM_VERSION=${PLATFORM_VERSION}
+LABEL org.opencontainers.image.version="${PLATFORM_VERSION}"
+
+LABEL org.opencontainers.image.title="Config365 All-in-One"
+LABEL org.opencontainers.image.description="Portal + Gitea + act_runner in a single container for Azure Container Apps"
+
+# ── System packages ───────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        wget \
+        git \
+        supervisor \
+        python3 \
+        python3-pip \
+        make \
+        g++ \
+        gnupg \
+        lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Azure CLI ─────────────────────────────────────────────────────────────────
+# Installed for Blob Storage upload and managed identity auth in backup scripts.
+RUN curl -sLS https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" \
+       > /etc/apt/sources.list.d/azure-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends azure-cli \
+    && rm -rf /var/lib/apt/lists/* \
+    && az --version | head -1
+
+# urllib3 CVE-2026-44431 / CVE-2026-44432: upgrade to >=2.7.0
+RUN pip3 install "urllib3>=2.7.0"
+
+# PyJWT / cryptography: patch azure-cli bundled Python deps flagged by Trivy
+RUN /opt/az/bin/python3 -m pip install --upgrade "PyJWT>=2.13.0" "cryptography>=48.0.1"
+
+# ── Node.js 22 ────────────────────────────────────────────────────────────────
+# Install from the official nodejs.org tarball (not NodeSource apt). ACR builders
+# intermittently get HTTP 403 from deb.nodesource.com, which breaks both the
+# setup script and a later apt-get upgrade that still references that repo.
+ARG NODE_VERSION=22.23.1
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" \
+      | tar -xz -C /usr/local --strip-components=1 \
+    && npm install -g npm@latest \
+    # supervisord still launches /usr/bin/node (NodeSource apt path). Keep that
+    # path working after switching to the official tarball under /usr/local.
+    && ln -sf /usr/local/bin/node /usr/bin/node \
+    && ln -sf /usr/local/bin/npm /usr/bin/npm \
+    && ln -sf /usr/local/bin/npx /usr/bin/npx \
+    && /usr/bin/node --version && /usr/bin/npm --version
+
+# ── Gitea binary ──────────────────────────────────────────────────────────────
+# TEMP (dev perf): pin 1.26.1 to match wiped_dev volume after June-18 rollback.
+# Restore GITEA_VERSION=1.27.0 (+ RUNNER_VERSION=2.1.0) when perf work is done.
+ARG GITEA_VERSION=1.26.1
+RUN wget -qO /usr/local/bin/gitea \
+      "https://dl.gitea.com/gitea/${GITEA_VERSION}/gitea-${GITEA_VERSION}-linux-amd64" \
+    && chmod +x /usr/local/bin/gitea \
+    && gitea --version
+
+# ── act_runner binary (gitea-runner v1.0.3+) ──────────────────────────────────
+# Project was renamed from act_runner → gitea-runner at v1.0.0.
+# Binary is saved to the legacy path so runner-start.sh and entrypoint-aio.sh
+# require no changes.
+# TEMP: 1.0.3 pairs with Gitea 1.26.1 (see GITEA_VERSION note above).
+ARG RUNNER_VERSION=1.0.3
+RUN wget -qO /usr/local/bin/act_runner \
+      "https://dl.gitea.com/gitea-runner/${RUNNER_VERSION}/gitea-runner-${RUNNER_VERSION}-linux-amd64" \
+    && chmod +x /usr/local/bin/act_runner \
+    && act_runner --version || true
+
+# ── Caddy binary ──────────────────────────────────────────────────────────────
+# Copied from the official Docker Hub image — avoids wget-ing from GitHub which
+# is blocked or unreliable in the Azure Container Registry build environment.
+# 2.11.4: Caddy CVEs + go-jose 3.0.5 + x/crypto 0.52 + x/net 0.55.
+# (COPY --from does not support ARG expansion — keep tag literal in sync with comment.)
+COPY --from=caddy:2.11.4 /usr/bin/caddy /usr/local/bin/caddy
+RUN caddy version
+
+# ── PowerShell M365 modules ───────────────────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN pwsh -NonInteractive -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted"
+
+RUN pwsh -NonInteractive -Command \
+    "Install-Module Microsoft.Graph -Force -Scope AllUsers -ErrorAction Stop; \
+     Write-Host 'Microsoft.Graph installed.'"
+
+RUN pwsh -NonInteractive -Command \
+    "Install-Module ExchangeOnlineManagement -MinimumVersion 3.5.1 -Force -Scope AllUsers -ErrorAction Stop; \
+     Write-Host ('ExchangeOnlineManagement ' + (Get-Module ExchangeOnlineManagement -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version) + ' installed.')"
+
+RUN pwsh -NonInteractive -Command \
+    "Install-Module PnP.PowerShell -MinimumVersion 2.5.0 -Force -Scope AllUsers -ErrorAction Stop; \
+     Write-Host ('PnP.PowerShell ' + (Get-Module PnP.PowerShell -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version) + ' installed.')"
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        mono-runtime \
+        libmono-system-web-services4.0-cil \
+        libmono-system-web4.0-cil \
+    && rm -rf /var/lib/apt/lists/* \
+    && MONO_WEB_SERVICES_DLL="" \
+    && for candidate in \
+         /usr/lib/mono/gac/System.Web.Services/4.0.0.0__b03f5f7f11d50a3a/System.Web.Services.dll \
+         /usr/lib/mono/4.5/System.Web.Services.dll \
+         /usr/lib/mono/4.5-api/System.Web.Services.dll; do \
+         if [ -f "$candidate" ]; then MONO_WEB_SERVICES_DLL="$candidate"; break; fi; \
+       done \
+    && if [ -n "$MONO_WEB_SERVICES_DLL" ]; then \
+         ln -sf "$MONO_WEB_SERVICES_DLL" /opt/microsoft/powershell/7/System.Web.Services.dll; \
+       fi
+
+RUN pwsh -NonInteractive -Command \
+    "Install-Module AIPService -Force -Scope AllUsers -ErrorAction Stop; \
+     Write-Host ('AIPService ' + (Get-Module AIPService -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version) + ' installed.')"
+
+RUN pwsh -NonInteractive -Command \
+    "Import-Module Microsoft.Graph.Authentication -ErrorAction Stop; \
+     Import-Module ExchangeOnlineManagement -ErrorAction Stop; \
+     Import-Module PnP.PowerShell -ErrorAction Stop; \
+     Write-Host 'Module verification passed (AIPService verified at runtime via Import-AipServiceModuleSafe).'"
+
+# ── Portal (built in stage 1 — Next.js standalone) ───────────────────────────
+WORKDIR /app
+
+# Copy the self-contained standalone server
+COPY --from=portal-build /build/.next/standalone ./
+# Static assets must live at .next/static alongside the server
+COPY --from=portal-build /build/.next/static ./.next/static
+# Public directory
+COPY --from=portal-build /build/public ./public
+# Standalone token-api-server (managed by supervisord on port 4322)
+COPY --from=portal-build /build/token-api-server.mjs ./
+COPY --from=portal-build /build/run-migrations.mjs ./
+COPY VERSION ./VERSION
+
+# Install MSSQL + Azure SDK packages needed at runtime by:
+#   - the Next.js portal server (db-mssql.ts, token-backend-keyvault.ts, etc.)
+#   - token-api-server.mjs (mssql / Azure SDKs are esbuild --external)
+# next.config.ts lists mssql/tedious in serverExternalPackages so they are NOT bundled
+# by Next.js; they must be present here.
+#
+# Install into an isolated prefix — never run `npm install` inside /app after
+# better-sqlite3 is in place (that reinstalls the package as source-only and
+# drops the native .node binary).
+RUN mkdir -p /tmp/runtime-npm \
+    && printf '%s\n' \
+         '{' \
+         '  "dependencies": {' \
+         '    "mssql": "^11.0.1",' \
+         '    "@azure/identity": "^4.5.0",' \
+         '    "@azure/keyvault-secrets": "^4.9.0",' \
+         '    "@azure/storage-blob": "^12.26.0"' \
+         '  }' \
+         '}' > /tmp/runtime-npm/package.json \
+    && npm install --prefix /tmp/runtime-npm 2>&1 \
+    && mkdir -p /app/node_modules \
+    && cp -rp /tmp/runtime-npm/node_modules/. /app/node_modules/ \
+    && rm -rf /tmp/runtime-npm \
+    && echo "Azure/MSSQL runtime packages OK"
+
+# better-sqlite3 native bindings are NOT traced by Next.js standalone and must be
+# installed in the runtime stage to match its exact Node.js version.
+# Install LAST so later npm installs cannot replace the compiled .node binary.
+# Force a node-gyp rebuild: ACR builds often cannot fetch prebuilds, and
+# `require('better-sqlite3')` alone is a false positive (bindings load on open).
+# Do not pass --build-from-source to npm: npm 11+ treats unknown CLI flags as errors.
+RUN BSQ_VER=$(node -e "try{process.stdout.write(require('/app/node_modules/better-sqlite3/package.json').version)}catch(e){process.stdout.write('11')}") \
+    && echo "Installing better-sqlite3@${BSQ_VER} for runtime Node..." \
+    && mkdir -p /tmp/bsql \
+    && echo "{\"dependencies\":{\"better-sqlite3\":\"${BSQ_VER}\"}}" > /tmp/bsql/package.json \
+    && npm install --prefix /tmp/bsql 2>&1 \
+    && (cd /tmp/bsql/node_modules/better-sqlite3 && npx --yes node-gyp rebuild --release) \
+    && test -f /tmp/bsql/node_modules/better-sqlite3/build/Release/better_sqlite3.node \
+    && rm -rf /app/node_modules/better-sqlite3 \
+    && cp -rp /tmp/bsql/node_modules/better-sqlite3 /app/node_modules/better-sqlite3 \
+    && rm -rf /tmp/bsql \
+    && node -e "require('/app/node_modules/better-sqlite3')(':memory:').close()" \
+    && echo "better-sqlite3 bindings OK"
+
+# linux-libc-dev ships unfixed kernel-header CVEs (CVE-2024-35870 etc.).
+# It is only needed to compile better-sqlite3 above — remove it now along with
+# the other build-only packages to eliminate the scanner findings.
+RUN apt-get remove --purge -y linux-libc-dev && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Runner configs ─────────────────────────────────────────────────────────────
+RUN mkdir -p /etc/act_runner /etc/supervisord.d
+COPY runner/config-host.yml /etc/act_runner/config.yml
+COPY runner/config-shard.yml /etc/act_runner/config-shard.yml
+COPY runner/config-docker.yml /etc/act_runner/config-docker.yml
+
+# ── Pipeline templates (seeded into config365/orchestrator on startup) ───────
+# CACHE_BUST_TEMPLATES is bumped manually to force Docker to re-copy pipeline-templates
+ARG CACHE_BUST_TEMPLATES=4
+RUN echo "pipeline-templates cache bust: $CACHE_BUST_TEMPLATES"
+COPY pipeline-templates/ /pipeline-templates-staging/
+
+# ── PowerShell scripts (synced to config365/orchestrator on startup) ─────────
+# Config365/runner/scripts/ is the primary source of truth — no OM365DO mount needed
+COPY runner/scripts/ /scripts-staging/
+RUN find /scripts-staging -name '*.sh' -exec sed -i 's/\r$//' {} +
+
+# ── Intune Win32 packagers (not synced as text to Gitea) ─────────────────────
+COPY runner/tools/ /usr/local/share/config365/tools-fallback/
+COPY scripts/update-intunewin-cli.sh /usr/local/bin/update-intunewin-cli.sh
+COPY scripts/update-intunewin-app-util.sh /usr/local/bin/update-intunewin-app-util.sh
+# Prefer the Go-1.26.5 rebuild over the upstream release binary (still Go 1.25.3).
+COPY --from=intunewin-build /out/intunewin /usr/local/share/config365/tools/intunewin
+RUN sed -i 's/\r$//' /usr/local/bin/update-intunewin-cli.sh /usr/local/bin/update-intunewin-app-util.sh \
+ && chmod +x /usr/local/bin/update-intunewin-cli.sh /usr/local/bin/update-intunewin-app-util.sh \
+             /usr/local/share/config365/tools/intunewin \
+ && mkdir -p /usr/local/share/config365/tools \
+ && INTUNE_WIN_APP_UTIL_UPDATE_TIMEOUT=60 /usr/local/bin/update-intunewin-app-util.sh \
+ || cp /usr/local/share/config365/tools-fallback/IntuneWinAppUtil.exe /usr/local/share/config365/tools/IntuneWinAppUtil.exe 2>/dev/null \
+ || echo "WARN: IntuneWinAppUtil.exe not available (Windows fallback only)"
+
+# ── Backup scripts and config helper ─────────────────────────────────────────
+COPY read-config.js            /usr/local/bin/read-config.js
+COPY backup-gitea-blob.sh      /usr/local/bin/backup-gitea-blob.sh
+COPY backup-cron-wrapper.sh    /usr/local/bin/backup-cron-wrapper.sh
+RUN chmod +x /usr/local/bin/backup-gitea-blob.sh /usr/local/bin/backup-cron-wrapper.sh
+
+# ── Caddy config ──────────────────────────────────────────────────────────────
+RUN mkdir -p /etc/caddy
+COPY Caddyfile.aio /etc/caddy/Caddyfile
+
+# ── Supervisor config and entrypoint ─────────────────────────────────────────
+COPY supervisord.conf /etc/supervisord.conf
+COPY entrypoint-aio.sh /entrypoint-aio.sh
+COPY runner-start.sh /usr/local/bin/runner-start.sh
+COPY portal-warmup.sh /usr/local/bin/portal-warmup.sh
+COPY scripts/configure-runner-git-credentials.sh /usr/local/bin/configure-runner-git-credentials.sh
+COPY scripts/persist-data.sh /usr/local/bin/persist-data.sh
+COPY scripts/app-update.sh /usr/local/bin/app-update.sh
+COPY scripts/setup-runner-shards.sh /usr/local/bin/setup-runner-shards.sh
+RUN sed -i 's/\r//' /entrypoint-aio.sh /usr/local/bin/runner-start.sh /usr/local/bin/portal-warmup.sh \
+    /usr/local/bin/configure-runner-git-credentials.sh /usr/local/bin/persist-data.sh \
+    /usr/local/bin/app-update.sh /usr/local/bin/setup-runner-shards.sh \
+ && chmod +x /entrypoint-aio.sh /usr/local/bin/runner-start.sh /usr/local/bin/portal-warmup.sh \
+    /usr/local/bin/configure-runner-git-credentials.sh /usr/local/bin/persist-data.sh \
+    /usr/local/bin/app-update.sh /usr/local/bin/setup-runner-shards.sh
+
+# ── Git user for Gitea (refuses to run as root) ───────────────────────────────
+RUN useradd -r -s /bin/bash -m -d /home/git -u 1000 git
+
+# ── Runtime directories ───────────────────────────────────────────────────────
+# Persistent state lives at /home/config365-data, symlinked to /data at startup.
+# Local Docker: mount a named volume at /home/config365-data
+# Azure App Service: /home persists when WEBSITES_ENABLE_APP_SERVICE_STORAGE=true
+#
+# Under /data (→ /home/config365-data):
+#   gitea/          - Gitea work dir (conf, repos, logs) — owned by git
+#   gitea-internal/ - Gitea SQLite DB + LevelDB queues (never on SMB)
+#   init-data/      - bootstrap tokens (portal-token.txt, runner-token.txt)
+#   runner/         - act_runner .runner registration file
+#   db/             - portal SQLite database
+#
+# Optional second mount (Azure Files SMB):
+#   /mnt/gitea           - recommended path; set GITEA_EXTERNAL_DIR=/mnt/gitea to
+#                          move conf, repos, LFS, logs, and custom templates here.
+#                          Required SMB mount options: nobrl,mfsymlinks
+#                          Azure Container Apps: configure an Azure Files volume mount.
+RUN mkdir -p /data/gitea/conf /data/gitea-internal /data/init-data /data/runner /data/db \
+    && chown -R git:git /data/gitea /data/gitea-internal /data/init-data
+
+# Patch OS packages (e.g. openssl) after all apt installs — keeps Trivy os-pkg gate clean.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Environment defaults (override via Azure Container Apps env vars) ─────────
+ENV NODE_ENV=production
+ENV HOSTNAME=0.0.0.0
+ENV PORT=4321
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV GITEA_WORK_DIR=/data/gitea
+ENV GITEA_CUSTOM=/data/gitea/custom
+
+# 80    = Caddy (public ingress — routes /gitea/* to Gitea, /* to portal)
+# 3000  = Gitea internal (not exposed on the host; Caddy proxies /gitea/* only)
+EXPOSE 80
+
+# Do NOT declare VOLUME ["/data"] — on Azure App Service that creates an anonymous
+# mount at /data which is still ephemeral and blocks our /home bind-mount logic.
+
+ENTRYPOINT ["/entrypoint-aio.sh"]

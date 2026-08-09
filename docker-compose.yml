@@ -1,0 +1,38 @@
+services:
+  # All-in-one Config365 stack. Always start with: docker compose up -d --build
+  # Do not use standalone docker run — compose applies PORTAL_HTTP_PORT, volumes, and env.
+  config365:
+    build:
+      context: .
+      dockerfile: Dockerfile.aio
+    image: config365-aio:latest
+    container_name: config365-aio
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${PORTAL_HTTP_PORT:-8080}:80"   # host:container — Caddy listens on 80 inside
+    environment:
+      PORTAL_HTTP_PORT: ${PORTAL_HTTP_PORT:-8080}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      GITEA_ORG: ${GITEA_ORG:-config365}
+      GITEA_RUNNER_NAME: ${GITEA_RUNNER_NAME:-config365-runner}
+      RUNNER_SHARDS: ${RUNNER_SHARDS:-4}
+      PLATFORM_ADMIN_OIDS: ${PLATFORM_ADMIN_OIDS:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-false}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      DEBUG_PIPELINE_TEMPLATES_DIR: /debug-staging/pipeline-templates
+    volumes:
+      - config365-data:/home/config365-data
+      - ${DEBUG_PATH:-./.debug}:/debug-staging:ro
+      # To store Gitea data (conf, repos, LFS, logs) on an Azure Files SMB share:
+      # 1. Mount the share on the Docker host first:
+      #      sudo mount -t cifs //account.file.core.windows.net/gitea /mnt/gitea \
+      #        -o vers=3.0,username=<account>,password=<key>,nobrl,mfsymlinks,uid=1000,gid=1000
+      # 2. Uncomment the line below and set GITEA_EXTERNAL_DIR in .env:
+      #    - /mnt/gitea:/mnt/gitea
+    restart: unless-stopped
+
+volumes:
+  config365-data:
+    name: config365-data   # fixed name — mount at /home/config365-data (same layout as Azure)

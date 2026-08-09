@@ -1,0 +1,25 @@
+# Config365 act_runner — Legacy single-runner host config (image default only).
+# Runtime uses sharded configs from /etc/act_runner/config-shard.yml copied to
+# /data/runner-shards/{N}/config.yml — see setup-runner-shards.sh.
+#
+# Workflow files can use any of:
+#   runs-on: self-hosted
+#   runs-on: ubuntu-latest
+#   runs-on: ubuntu-22.04
+#   runs-on: ubuntu-24.04
+
+log:
+  level: info
+
+runner:
+  # Maximum duration a single job is allowed to run
+  timeout: 3h
+  # Host mode shares one PTY — only one job at a time (parallel pwsh steps deadlock).
+  # Use docker-mode runner with capacity 3–5 for concurrent tenant jobs.
+  capacity: 1
+
+cache:
+  # Disable the built-in cache server; it requires Docker networking not available in host mode
+  enabled: false
+
+# No [container] block — host mode runs commands directly, no container spawning

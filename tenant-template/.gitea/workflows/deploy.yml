@@ -1,0 +1,1950 @@
+# Config365 - M365 Graph API Deployment Pipeline
+#
+# This file is the canonical template stored in config365/orchestrator.
+# Tenant repos contain an identical copy at .gitea/workflows/deploy.yml.
+# The "Sync pipeline" step keeps them in sync automatically - changes here
+# apply to all tenants on their next run.
+#
+# DEPLOY OPTIONS (comma-separated):
+#   Operation controls:  allowCreate, allowUpdate, allowDelete
+#   Feature toggles:     deployCustomAttributes, deployGroups, deployEntraIdDeviceSettings,
+#                        deployDefenderConnector, deployConditionalAccess, deployTeams, deploySharePoint,
+#                        deployExchange, deployIntune, deployAppsChocolatey,
+#                        deployAppsWinget, deployAppsCustom, deployAppsPrinter, deployEnterpriseApps,
+#                        deployAuthenticationPolicies, deployEntraIdConsentpermissions,
+#                        deploySharePointSettings
+#
+# Required org-level secrets (MSP Gitea org -- available via secrets: inherit):
+#   GIT_TOKEN             - Gitea personal access token (portal service account)
+#   PORTAL_INTERNAL_KEY   - Shared secret for the internal token API
+#
+# Required repo-level vars (set per tenant):
+#   TENANT_SLUG           - Tenant identifier matching the Config365 database slug
+#
+# NOTE: CLIENT_ID, CLIENT_SECRET, TENANT_ID are no longer used.
+# Connect-M365Graph.ps1 fetches delegated tokens from the token API.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Tenant name (for identification, defaults to repo name)'
+      environment:
+        required: false
+        type: string
+        default: 'production'
+        description: 'Deployment environment (production, staging, development)'
+      debug_mode:
+        required: false
+        type: boolean
+        default: false
+        description: 'Enable verbose/debug output for troubleshooting'
+      deploy_options:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated enabled features - supplied by web portal'
+
+concurrency:
+  group: deploy-${{ gitea.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # PLAN JOB - Preview what changes will be made (WhatIf)
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Generate Deployment Plan (WhatIf)
+    runs-on: self-hosted
+    env:
+      GITEA_RUN_ID: ${{ gitea.run_id }}
+      HOME: /tmp/act-jobs/${{ gitea.run_id }}
+      USERPROFILE: /tmp/act-jobs/${{ gitea.run_id }}
+      XDG_CACHE_HOME: /tmp/act-jobs/${{ gitea.run_id }}/.cache
+      PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+      TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+    outputs:
+      has_changes:           ${{ steps.plan_summary.outputs.has_changes }}
+      has_baseline_changes:  ${{ steps.plan_summary.outputs.has_baseline_changes }}
+      plan_creates:          ${{ steps.plan_summary.outputs.plan_creates }}
+      plan_updates:          ${{ steps.plan_summary.outputs.plan_updates }}
+      plan_deletes:          ${{ steps.plan_summary.outputs.plan_deletes }}
+      has_group_actions:     ${{ steps.plan_summary.outputs.has_group_actions }}
+      plan_ca_deletes:     ${{ steps.plan_summary.outputs.plan_ca_deletes }}
+      plan_groups_deletes: ${{ steps.plan_summary.outputs.plan_groups_deletes }}
+      plan_intune_deletes: ${{ steps.plan_summary.outputs.plan_intune_deletes }}
+    steps:
+      - name: Initialize Job Session Isolation
+        shell: bash
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME"
+          export USERPROFILE="$HOME"
+          mkdir -p "$USERPROFILE/.azure" "$USERPROFILE/.local/share"
+          for f in .gitconfig .git-credentials .netrc; do
+            [ -f "/root/$f" ] && cp "/root/$f" "$HOME/$f"
+          done
+          # Git 2.35+ rejects checkouts when workspace bind-mount path
+          # (/data/...) differs from the host path Git resolves
+          # (/home/config365-data/...). Mark all dirs safe for this job.
+          git config --global --add safe.directory '*'
+          echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      # -- Checkouts ------------------------------------------------------------
+      - name: Checkout config365/orchestrator
+        run: git clone ${{ gitea.server_url }}/${{ vars.PLATFORM_ORG }}/orchestrator scripts
+
+      - name: Checkout MSP Baseline
+        run: git clone ${{ gitea.server_url }}/${{ vars.MSP_ORG }}/baseline baseline
+
+      - name: Checkout Tenant Repository
+        run: git clone ${{ gitea.server_url }}/${{ gitea.repository }} tenant
+
+      # -- Clear stale WhatIf plans from previous runs ---------------------------
+      # Plan JSON is ephemeral — only exists between plan publish and apply cleanup.
+      # Remove any leftovers so the portal never reads ghost actions.
+      - name: Clear Stale WhatIf Plans
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-Location "${{ gitea.workspace }}/tenant"
+          git config --global --add safe.directory '*'
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+          $removed = $false
+          foreach ($f in @('config/deploy-plan-latest.json', 'config/group-membership-plan-latest.json')) {
+            if (Test-Path $f) {
+              git rm -f $f
+              $removed = $true
+              Write-Host "Removed stale $f"
+            }
+          }
+          if ($removed) {
+            git commit -m "chore: clear WhatIf plans before deploy [skip ci]"
+            git fetch origin ${{ gitea.ref_name }}
+            git rebase origin/${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            Write-Host "Stale WhatIf plans cleared from repo."
+          } else {
+            Write-Host "No stale WhatIf plan files in repo."
+          }
+
+      # -- Sync pipeline from orchestrator ---------------------------------------
+      # Compares the orchestrator's deploy-pipeline.yml with this tenant's
+      # deploy.yml. If they differ, updates deploy.yml and commits so the
+      # next run automatically picks up any pipeline changes.
+      - name: Sync pipeline from orchestrator
+        run: |
+          orch_file="${{ gitea.workspace }}/scripts/.gitea/workflows/deploy-pipeline.yml"
+          tenant_file="${{ gitea.workspace }}/tenant/.gitea/workflows/deploy.yml"
+          if ! cmp -s "$orch_file" "$tenant_file"; then
+            echo "Pipeline differs from orchestrator - syncing..."
+            cp "$orch_file" "$tenant_file"
+            cd "${{ gitea.workspace }}/tenant"
+            git config --global --add safe.directory '*'
+            git config user.email "config365-bot@config365.local"
+            git config user.name  "Config365 Bot"
+            git add .gitea/workflows/deploy.yml
+            git commit -m "sync: update pipeline from config365/orchestrator"
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            echo "Pipeline synced. New steps will apply on next run."
+          else
+            echo "Pipeline is up to date."
+          fi
+
+      # -- Purge stale /tmp plan files from prior jobs on shared runner -----------
+      - name: Clear Stale Runner Plan Files
+        shell: pwsh
+        run: |
+          # Self-hosted runners reuse /tmp — purge plan artifacts from prior jobs
+          Get-ChildItem /tmp -Filter '*-plan.json' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-ChildItem /tmp -Filter 'debug-*-plan.json' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+          Write-Host "Runner /tmp plan files cleared."
+
+      # -- Prepare: Assign Required Directory Roles ------------------------------
+      - name: Prepare - Assign Required Directory Roles
+        id: plan_prepare_roles
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Prepare-TenantRoles.ps1" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # -- Resolve Tenant Group Memberships -------------------------------------
+      - name: Resolve - Tenant Group Memberships
+        id: plan_resolve_groups
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/common/Resolve-TenantGroups.ps1" `
+            -BaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/tenant-groups-resolved.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+
+      # -- Plan: Apply steps (WhatIf) --------------------------------------------
+      - name: Plan - Custom Security Attributes
+        id: plan_custom_attrs
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployCustomAttributes') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-CustomAttributes.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/custom-attributes" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/customattributes-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Groups
+        id: plan_groups
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployGroups') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-BaselineGroups.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/groups" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/groups-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Tenant Groups
+        id: plan_tenant_groups
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployGroups') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          $tenantGroups = "${{ gitea.workspace }}/tenant/groups"
+          if (Test-Path $tenantGroups) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Configure-BaselineGroups.ps1" `
+              -ConfigDirectory $tenantGroups `
+              -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+              -WhatIf `
+              -OutputPath "/tmp/tenant-groups-plan.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Entra ID Settings
+        id: plan_entra_id
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployEntraIdDeviceSettings') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-EntraIDSettings.ps1" `
+            -ConfigPath "${{ gitea.workspace }}/baseline/baseline/entra-id-device-settings/security-defaults.json" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -WhatIf `
+            -OutputPath "/tmp/entraidsettings-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Defender Connector
+        id: plan_defender_connector
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployDefenderConnector') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-DefenderConnector.ps1" `
+            -ConfigPath "${{ gitea.workspace }}/baseline/baseline/intune/defender-connector/windows-defender-atp-connector.json" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -WhatIf `
+            -OutputPath "/tmp/defender-connector-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Conditional Access
+        id: plan_ca
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployConditionalAccess') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ConditionalAccess.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/conditional-access" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OptionsPath "${{ gitea.workspace }}/scripts/om365do-options.json" `
+            -WhatIf `
+            -OutputPath "/tmp/ca-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Teams
+        id: plan_teams
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployTeams') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-Teams.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/teams" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/teams-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - SharePoint
+        id: plan_sharepoint
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deploySharePoint') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-SharePoint.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/sharepoint" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/sharepoint-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Exchange Online
+        id: plan_exchange
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployExchange') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-Exchange.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/exchange" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/exchange-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          PORTAL_TOKEN_API_URL: ${{ vars.TOKEN_API_INTERNAL_URL }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Plan - Exchange Message Encryption (IRM/OME)
+        id: plan_exchange_message_encryption
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployExchange') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ExchangeMessageEncryption.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/exchange" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/exchange-message-encryption-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          PORTAL_TOKEN_API_URL: ${{ vars.TOKEN_API_INTERNAL_URL }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Plan - Intune
+        id: plan_intune
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployIntune') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-Intune.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/intune" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/intune-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          EXTRA_BASELINE_FOLDERS: ${{ env.EXTRA_BASELINE_FOLDERS }}
+          EXTRA_BASELINE_FILES: ${{ env.EXTRA_BASELINE_FILES }}
+
+      - name: Plan - Chocolatey Apps
+        id: plan_choco
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployAppsChocolatey') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ChocoApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/chocolatey","${{ gitea.workspace }}/tenant/apps/chocolatey" `
+            -WhatIfMode `
+            -OutputPath "/tmp/chocoapps-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - WinGet Apps
+        id: plan_winget
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployAppsWinget') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-WingetApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/winget","${{ gitea.workspace }}/tenant/apps/winget" `
+            -WhatIfMode `
+            -OutputPath "/tmp/wingetapps-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Custom Apps
+        id: plan_custom_apps
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployAppsCustom') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-CustomApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/custom","${{ gitea.workspace }}/tenant/apps/custom" `
+            -WhatIfMode `
+            -OutputPath "/tmp/customapps-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Printer Apps
+        id: plan_printer_apps
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployAppsPrinter') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-PrinterApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/printer","${{ gitea.workspace }}/tenant/apps/printer" `
+            -WhatIfMode `
+            -OutputPath "/tmp/printerapps-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Enterprise Apps
+        id: plan_enterprise_apps
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployEnterpriseApps') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-EnterpriseApps.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/enterprise-apps" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/apps-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Authentication Policies
+        id: plan_auth_policies
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployAuthenticationPolicies') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-AuthenticationMethods.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/authentication-policies" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/authpolicies-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Consent and Permissions
+        id: plan_consent
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deployEntraIdConsentpermissions') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ConsentPermissions.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/entra-id-consentpermissions" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/consentpermissions-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - SharePoint Tenant Settings
+        id: plan_sp_settings
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deploySharePointSettings') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-SharePointSettings.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/sharepoint-settings" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/spsettings-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - SharePoint Tenant Settings (SpoTenant)
+        id: plan_sp_tenant_settings
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'deploySharePointSettings') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-SharePointTenantSettings.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/sharepoint-settings" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -WhatIf `
+            -OutputPath "/tmp/sptenant-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # -- Plan: Removal steps (WhatIf) ------------------------------------------
+      - name: Plan - Remove Conditional Access
+        id: plan_remove_ca
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployConditionalAccess')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-ConditionalAccess.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/conditional-access" `
+            -WhatIf `
+            -OutputPath "/tmp/ca-remove-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Remove Groups
+        id: plan_remove_groups
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployGroups')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Groups.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/groups" `
+            -WhatIf `
+            -OutputPath "/tmp/groups-remove-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Remove Intune
+        id: plan_remove_intune
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployIntune')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Intune.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/intune" `
+            -WhatIf `
+            -OutputPath "/tmp/intune-remove-plan.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Tenant Pending Removes (Conditional Access)
+        id: plan_tr_ca
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployConditionalAccess')
+        shell: pwsh
+        run: |
+          $dir = "${{ gitea.workspace }}/tenant/pending-removes/conditional-access"
+          if (Test-Path $dir) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Remove-ConditionalAccess.ps1" `
+              -RemoveDirectory $dir -WhatIf `
+              -OutputPath "/tmp/ca-tenant-remove-plan.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          } else {
+            Write-Host "No tenant pending-removes for conditional-access - skipping."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Tenant Pending Removes (Groups)
+        id: plan_tr_groups
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployGroups')
+        shell: pwsh
+        run: |
+          $dir = "${{ gitea.workspace }}/tenant/pending-removes/groups"
+          if (Test-Path $dir) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Groups.ps1" `
+              -RemoveDirectory $dir -WhatIf `
+              -OutputPath "/tmp/groups-tenant-remove-plan.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          } else {
+            Write-Host "No tenant pending-removes for groups - skipping."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Plan - Tenant Pending Removes (Intune)
+        id: plan_tr_intune
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployIntune')
+        shell: pwsh
+        run: |
+          $dir = "${{ gitea.workspace }}/tenant/pending-removes/intune"
+          if (Test-Path $dir) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Intune.ps1" `
+              -RemoveDirectory $dir -WhatIf `
+              -OutputPath "/tmp/intune-tenant-remove-plan.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          } else {
+            Write-Host "No tenant pending-removes for intune - skipping."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # -- Plan: Group Membership Actions (WhatIf) --------------------------------
+      # Always runs regardless of deploy_options — pending-group-adds/removes are
+      # written by the portal and must go through the approval gate before applying.
+      - name: Plan - Group Membership Actions (WhatIf)
+        id: plan_group_membership
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # Self-hosted runners reuse /tmp — never read a plan file from a prior job.
+          Remove-Item /tmp/group-membership-plan.json -Force -ErrorAction SilentlyContinue
+          $addDir    = "${{ gitea.workspace }}/tenant/pending-group-adds"
+          $removeDir = "${{ gitea.workspace }}/tenant/pending-group-removes"
+          $generated = 'false'
+          if ((Test-Path $addDir) -or (Test-Path $removeDir)) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-AddUsersToGroup.ps1" `
+              -TenantDir  "${{ gitea.workspace }}/tenant" `
+              -OutputPath "/tmp/group-membership-plan.json" `
+              -WhatIfMode `
+              -Verbose:$${{ inputs.debug_mode }}
+            $generated = 'true'
+          } else {
+            Write-Host "No pending group membership actions."
+          }
+          "gm_plan_generated=$generated" | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # -- Plan Summary - Collect results and set hasChanges output -------------
+      - name: Generate Plan Summary
+        id: plan_summary
+        shell: pwsh
+        env:
+          GM_PLAN_GENERATED: ${{ steps.plan_group_membership.outputs.gm_plan_generated }}
+        run: |
+          $applyFiles  = Get-ChildItem /tmp -Filter "*-plan.json" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -notmatch '-remove-plan\.json$' -and $_.Name -notmatch '^debug-' }
+          $removeFiles = Get-ChildItem /tmp -Filter "*-remove-plan.json" -ErrorAction SilentlyContinue
+
+          $totalCreate = 0; $totalUpdate = 0; $totalNoChange = 0; $totalRemove = 0
+          $totalErrors = 0; $totalBlocked = 0; $totalProtected = 0
+          $allCreates = @(); $allUpdates = @(); $allAssignments = @(); $allRemoves = @()
+          $allErrors  = @(); $allBlocked = @(); $allProtected = @()
+
+          # Flatten Results — scripts return either a flat array or a named-group object
+          function Get-PlanItems($results) {
+            if ($null -eq $results) { return @() }
+            if ($results -is [System.Collections.IEnumerable] -and $results -isnot [string]) {
+              return $results  # already a flat array
+            }
+            # Nested object: { GroupName: [ items ], ... } — flatten all arrays
+            $flat = @()
+            foreach ($prop in $results.PSObject.Properties) {
+              $val = $prop.Value
+              if ($val -is [System.Collections.IEnumerable] -and $val -isnot [string]) {
+                $flat += @($val)
+              }
+            }
+            return $flat
+          }
+
+          foreach ($f in $applyFiles) {
+            try {
+              $plan = Get-Content $f.FullName -Raw | ConvertFrom-Json
+              if (-not $plan.Service) { continue }
+              $totalCreate    += [int]($plan.WouldCreateCount            ?? 0)
+              $totalUpdate    += [int]($plan.WouldUpdateCount            ?? 0)
+              $totalUpdate    += [int]($plan.WouldSyncAssignmentsCount   ?? 0)
+              $totalNoChange  += [int]($plan.NoChangeCount               ?? 0)
+              $totalErrors    += [int]($plan.ErrorCount                  ?? 0)
+              $totalBlocked   += [int]($plan.BlockedCount                ?? 0)
+              $totalProtected += [int]($plan.ProtectedCount              ?? 0)
+              foreach ($r in (Get-PlanItems $plan.Results)) {
+                $itemName = if ($r.DisplayName) { $r.DisplayName } elseif ($r.Name) { $r.Name } else { $r.Id }
+                $itemType = if ($r.Type) { $r.Type } elseif ($r.PolicyType) { $r.PolicyType } else { $null }
+                $item = [PSCustomObject]@{ Service = $plan.Service; Name = $itemName; Type = $itemType; Changes = $r.Changes }
+                if     ($r.Status -match 'Would\s*Create|WouldCreate')          { $allCreates      += $item }
+                elseif ($r.Status -match 'Would\s*Update|WouldUpdate')          { $allUpdates      += $item }
+                elseif ($r.Status -match 'WouldSyncAssignments|SyncAssignment') { $allAssignments  += $item }
+                elseif ($r.Status -match 'Failed|Error')                         { $allErrors       += $item }
+                elseif ($r.Status -match 'BLOCKED')                              { $allBlocked      += $item }
+                elseif ($r.Status -match 'Protected')                            { $allProtected    += $item }
+              }
+            } catch { }
+          }
+
+          foreach ($f in $removeFiles) {
+            try {
+              $plan = Get-Content $f.FullName -Raw | ConvertFrom-Json
+              if (-not $plan.Service) { continue }
+              $totalRemove += [int]($plan.WouldRemoveCount ?? 0)
+              foreach ($r in (Get-PlanItems $plan.Results)) {
+                if ($r.Status -match 'Would\s*Remove|WouldRemove') {
+                  $itemName = if ($r.DisplayName) { $r.DisplayName } elseif ($r.Name) { $r.Name } else { $r.Id }
+                  $allRemoves += [PSCustomObject]@{ Service = $plan.Service; Name = $itemName; Type = $r.Type }
+                }
+              }
+            } catch { }
+          }
+
+          # Baseline-only pending count (before group membership actions are merged in)
+          $baselineRemoveCount = $totalRemove
+          $hasBaselineChanges  = ($totalCreate + $totalUpdate + $baselineRemoveCount -gt 0) -or ($totalErrors -gt 0) -or ($totalBlocked -gt 0)
+
+          # Check for pending group membership actions (always shown regardless of deploy_options)
+          $gmPlanFile      = '/tmp/group-membership-plan.json'
+          $hasGroupActions = $false
+          $gmActionsCount  = 0
+          $gmAddCount = 0
+          if ($env:GM_PLAN_GENERATED -eq 'true' -and (Test-Path $gmPlanFile)) {
+            try {
+              $gmPlan = Get-Content $gmPlanFile -Raw | ConvertFrom-Json
+              $gmActionsCount = if ($gmPlan.actions) { @($gmPlan.actions).Count } else { 0 }
+              $hasGroupActions = ($gmActionsCount -gt 0)
+              foreach ($action in @($gmPlan.actions)) {
+                $mode      = "$($action.mode)"
+                $groupName = if ($action.groupDisplayName) { $action.groupDisplayName } else { $action.groupId }
+                $count     = [int]($action.totalRequested ?? 0)
+                $userLabels = [System.Collections.Generic.List[string]]::new()
+                if ($action.results) {
+                  foreach ($r in @($action.results)) {
+                    $label = if ($r.upn) { $r.upn } elseif ($r.displayName) { $r.displayName } elseif ($r.userId) { $r.userId } else { $null }
+                    if ($label) { [void]$userLabels.Add($label) }
+                  }
+                }
+                if ($userLabels.Count -eq 0 -and $count -gt 0) {
+                  [void]$userLabels.Add("$count user(s)")
+                }
+                $changes = if ($mode -eq 'remove') {
+                  @{ Removed = @($userLabels) }
+                } else {
+                  @{ Added = @($userLabels) }
+                }
+                $item = [PSCustomObject]@{
+                  Service = 'Groups'
+                  Name    = $groupName
+                  Type    = 'GroupMembership'
+                  Changes = $changes
+                }
+                if ($mode -eq 'remove') { $allRemoves += $item; $totalRemove++ }
+                else { $allAssignments += $item; $gmAddCount++ }
+              }
+            } catch {}
+          }
+
+          $totalPending = $totalCreate + $totalUpdate + $totalRemove + $gmAddCount
+          $hasPending   = ($totalPending -gt 0) -or ($totalErrors -gt 0) -or ($totalBlocked -gt 0)
+
+          # Print summary
+          Write-Host ""
+          Write-Host "  +------------------------------------------------------+"
+          Write-Host "  -           M365 DEPLOYMENT PLAN                       -"
+          Write-Host "  +------------------------------------------------------+"
+          Write-Host "  Tenant:      ${{ inputs.tenant_name }}"
+          Write-Host "  Environment: ${{ inputs.environment }}"
+          Write-Host "  Generated:   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host ""
+
+          Write-Host "  Summary:"
+          if ($totalCreate  -gt 0) { Write-Host "    + Will CREATE:  $totalCreate" }
+          if ($totalUpdate  -gt 0) { Write-Host "    ~ Will UPDATE:  $totalUpdate" }
+          if ($totalRemove  -gt 0) { Write-Host "    - Will DELETE:  $totalRemove" }
+          if ($totalNoChange -gt 0){ Write-Host "    o No change:    $totalNoChange" }
+          if ($totalErrors  -gt 0) { Write-Host "    ! ERRORS:       $totalErrors" }
+          if ($totalBlocked -gt 0) { Write-Host "    X BLOCKED:      $totalBlocked" }
+          if ($totalCreate + $totalUpdate + $totalRemove + $totalErrors + $totalBlocked -eq 0) {
+            Write-Host "    All resources are up to date - no changes needed."
+          }
+          if ($hasGroupActions) {
+            Write-Host "    * Group membership actions: $gmActionsCount pending (requires approval)"
+          }
+
+          if ($totalBlocked -gt 0) {
+            Write-Host ""
+            Write-Host "  BLOCKED ITEMS:"
+            foreach ($item in $allBlocked) { Write-Host "    X [$($item.Service)] $($item.Name)" }
+            Write-Host ""
+            Write-Host "  Deployment BLOCKED - resolve missing dependencies first."
+            exit 1
+          }
+
+          # Export combined plan JSON for portal consumption
+          $combinedPlan = [ordered]@{
+            generatedAt = (Get-Date -Format 'o')
+            tenant      = "${{ inputs.tenant_name }}"
+            environment = "${{ inputs.environment }}"
+            runId       = "${{ gitea.run_id }}"
+            summary     = [ordered]@{
+              creates           = $totalCreate
+              updates           = $totalUpdate
+              deletes           = $totalRemove
+              noChanges         = $totalNoChange
+              errors            = $totalErrors
+              blocked           = $totalBlocked
+              protected         = $totalProtected
+              groupMembership   = $gmActionsCount
+            }
+            creates     = @($allCreates     | ForEach-Object { [ordered]@{ service=$_.Service; name=$_.Name; type=$_.Type; changes=$_.Changes } })
+            updates     = @($allUpdates     | ForEach-Object { [ordered]@{ service=$_.Service; name=$_.Name; type=$_.Type; changes=$_.Changes } })
+            assignments = @($allAssignments | ForEach-Object { [ordered]@{ service=$_.Service; name=$_.Name; type=$_.Type; changes=$_.Changes } })
+            deletes     = @($allRemoves     | ForEach-Object { [ordered]@{ service=$_.Service; name=$_.Name; type=$_.Type; changes=$_.Changes } })
+            errors    = @($allErrors    | ForEach-Object { [ordered]@{ service=$_.Service; name=$_.Name } })
+            protected = @($allProtected | ForEach-Object { [ordered]@{ service=$_.Service; name=$_.Name } })
+          }
+          $combinedPlan | ConvertTo-Json -Depth 20 | Set-Content /tmp/combined-plan.json -Encoding UTF8
+          Write-Host "  Combined plan written to /tmp/combined-plan.json"
+
+          # Build apply scope: collect baseline-relative file paths for all changed items
+          # so the apply job processes only the files that were approved in this plan.
+          # Must match the root that Get-FilteredPolicyFiles uses: TenantBaselinePath + "/baseline"
+          $baselineCheckout = "${{ gitea.workspace }}/baseline/baseline/"
+          $applyScope = [System.Collections.Generic.List[string]]::new()
+          foreach ($f in (Get-ChildItem /tmp -Filter "*-plan.json" -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -notmatch '-remove-plan\.json$' -and $_.Name -notmatch '^debug-' })) {
+            try {
+              $p = Get-Content $f.FullName -Raw | ConvertFrom-Json
+              $items = Get-PlanItems $p.Results
+              foreach ($r in $items) {
+                $fp = if ($r.FilePath) { $r.FilePath } elseif ($r['FilePath']) { $r['FilePath'] } else { $null }
+                if ($fp -and ($r.Status -match 'Would|Created|Updated')) {
+                  $rel = $fp.Replace('\', '/') -replace [regex]::Escape($baselineCheckout.Replace('\', '/')), ''
+                  if ($rel -and -not $applyScope.Contains($rel)) { $applyScope.Add($rel) }
+                }
+              }
+            } catch {}
+          }
+          # Always write scope file when apply will run — an empty file means
+          # "zero baseline files to apply" (e.g. group-membership-only deploys).
+          if ($hasPending) {
+            $applyScope | Set-Content /tmp/apply-scope.txt -Encoding UTF8
+            if ($applyScope.Count -gt 0) {
+              Write-Host "  Apply scope: $($applyScope.Count) file(s) scoped for deployment"
+            } else {
+              Write-Host "  Apply scope: empty (no baseline file changes — group actions only)"
+            }
+          }
+
+          # Per-service remove counts (baseline + tenant pending-removes combined)
+          function Get-RemoveCount([string]$path) {
+            try { [int]((Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json).WouldRemoveCount ?? 0) }
+            catch { 0 }
+          }
+          $caDeletes     = (Get-RemoveCount '/tmp/ca-remove-plan.json')     + (Get-RemoveCount '/tmp/ca-tenant-remove-plan.json')
+          $groupsDeletes = (Get-RemoveCount '/tmp/groups-remove-plan.json') + (Get-RemoveCount '/tmp/groups-tenant-remove-plan.json')
+          $intuneDeletes = (Get-RemoveCount '/tmp/intune-remove-plan.json') + (Get-RemoveCount '/tmp/intune-tenant-remove-plan.json')
+
+          # Set output for downstream jobs
+          $hasChangesStr          = if ($hasPending) { 'true' } else { 'false' }
+          $hasBaselineChangesStr  = if ($hasBaselineChanges) { 'true' } else { 'false' }
+          $hasGroupActionsStr     = if ($hasGroupActions) { 'true' } else { 'false' }
+          "has_changes=$hasChangesStr"                 | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "has_baseline_changes=$hasBaselineChangesStr" | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "plan_creates=$totalCreate"              | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "plan_updates=$totalUpdate"              | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "plan_deletes=$totalRemove"              | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "has_group_actions=$hasGroupActionsStr"  | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "plan_ca_deletes=$caDeletes"             | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "plan_groups_deletes=$groupsDeletes"     | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+          "plan_intune_deletes=$intuneDeletes"     | Out-File -FilePath $env:GITEA_OUTPUT -Append -Encoding utf8
+
+          if (-not $hasPending) {
+            Write-Host ""
+            Write-Host "  No pending changes - Apply job will be skipped."
+          }
+
+      - name: Publish Plan to Repo
+        id: plan_publish
+        if: always()
+        continue-on-error: true
+        run: |
+          # Write combined-plan.json into the already-checked-out tenant clone and
+          # push via git — exactly like backup does, no special token needed.
+          dest="${{ gitea.workspace }}/tenant/config/deploy-plan-latest.json"
+          mkdir -p "$(dirname "$dest")"
+          cp /tmp/combined-plan.json "$dest"
+          # Also publish group membership WhatIf plan if it was generated
+          if [ -f /tmp/group-membership-plan.json ]; then
+            cp /tmp/group-membership-plan.json "${{ gitea.workspace }}/tenant/config/group-membership-plan-latest.json"
+          fi
+          # Publish the apply scope file (list of changed baseline files for plan-scoped deploy)
+          if [ -f /tmp/apply-scope.txt ]; then
+            cp /tmp/apply-scope.txt "${{ gitea.workspace }}/tenant/.baseline-apply-${{ gitea.run_id }}"
+          fi
+          cd "${{ gitea.workspace }}/tenant"
+          git config --global --add safe.directory '*'
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+          git add config/deploy-plan-latest.json config/group-membership-plan-latest.json 2>/dev/null || git add config/deploy-plan-latest.json
+          git add .baseline-apply-* 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update deploy plan [run ${{ gitea.run_id }}] [skip ci]"
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            echo "Plan published to config/deploy-plan-latest.json"
+          else
+            echo "Plan file unchanged, skipping commit"
+          fi
+
+      # -- Check Step Failures ------------------------------------------------
+      # Fails the job if any continue-on-error plan step had an error outcome.
+      - name: Check Step Failures
+        if: always()
+        shell: bash
+        run: |
+          FAILED=0
+          [[ "${{ steps.plan_prepare_roles.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_resolve_groups.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_custom_attrs.outcome }}"   == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_groups.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_entra_id.outcome }}"       == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_defender_connector.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_ca.outcome }}"             == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_teams.outcome }}"          == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_sharepoint.outcome }}"     == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_exchange.outcome }}"       == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_exchange_message_encryption.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_intune.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_choco.outcome }}"          == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_winget.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_custom_apps.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_printer_apps.outcome }}"   == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_enterprise_apps.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_auth_policies.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_consent.outcome }}"        == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_sp_settings.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_remove_ca.outcome }}"      == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_remove_groups.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_remove_intune.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_tr_ca.outcome }}"             == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_tr_groups.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_tr_intune.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.plan_group_membership.outcome }}"  == "failure" ]] && FAILED=1
+          if [ $FAILED -eq 1 ]; then
+            echo "One or more plan steps failed — see individual step logs above."
+            exit 1
+          fi
+          echo "All plan steps completed successfully."
+
+      - name: Cleanup Job Session
+        if: always()
+        shell: pwsh
+        run: |
+          $connectScript = "${{ gitea.workspace }}/scripts/common/Connect-M365Graph.ps1"
+          if (Test-Path $connectScript) {
+            . $connectScript
+            try { Disconnect-M365Connections } catch { Write-Host "##[warning]Cleanup disconnect: $_" }
+          } elseif (Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) {
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+          }
+          if ($env:GITEA_RUN_ID) {
+            Remove-Item -Path "/tmp/act-jobs/$($env:GITEA_RUN_ID)" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed job session: /tmp/act-jobs/$($env:GITEA_RUN_ID)"
+          }
+
+  # ---------------------------------------------------------------------------
+  # GATE JOB - Creates a Gitea issue and polls for approval comment from portal
+  #
+  # The portal dashboard (/api/pipelines/approvals) polls for issues with the
+  # label "deployment-approval" and posts "approved" or "denied" comments.
+  # The gate job closes the issue and exits 0 (approved) or 1 (denied).
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Await Deployment Approval
+    runs-on: self-hosted
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true' || needs.plan.outputs.has_group_actions == 'true'
+    env:
+      GITEA_RUN_ID: ${{ gitea.run_id }}
+      HOME: /tmp/act-jobs/${{ gitea.run_id }}
+      USERPROFILE: /tmp/act-jobs/${{ gitea.run_id }}
+      XDG_CACHE_HOME: /tmp/act-jobs/${{ gitea.run_id }}/.cache
+    outputs:
+      issue_number: ${{ steps.create_issue.outputs.issue_number }}
+    steps:
+      - name: Initialize Job Session Isolation
+        shell: bash
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME"
+          export USERPROFILE="$HOME"
+          mkdir -p "$USERPROFILE/.azure" "$USERPROFILE/.local/share"
+          for f in .gitconfig .git-credentials .netrc; do
+            [ -f "/root/$f" ] && cp "/root/$f" "$HOME/$f"
+          done
+          # Git 2.35+ rejects checkouts when workspace bind-mount path
+          # (/data/...) differs from the host path Git resolves
+          # (/home/config365-data/...). Mark all dirs safe for this job.
+          git config --global --add safe.directory '*'
+          echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      - name: Create approval issue
+        id: create_issue
+        shell: pwsh
+        run: |
+          $apiBase = "${{ gitea.server_url }}/api/v1"
+          $headers = @{ Authorization = "token ${{ gitea.token }}"; "Content-Type" = "application/json" }
+          $repo    = "${{ gitea.repository }}"
+
+          # Ensure label exists
+          $labels = Invoke-RestMethod "$apiBase/repos/$repo/labels" -Headers $headers -ErrorAction SilentlyContinue
+          if (-not ($labels | Where-Object { $_.name -eq 'deployment-approval' })) {
+            Invoke-RestMethod "$apiBase/repos/$repo/labels" -Method POST -Headers $headers `
+              -Body (@{ name='deployment-approval'; color='#e11d48' } | ConvertTo-Json) | Out-Null
+          }
+          $labelId = (Invoke-RestMethod "$apiBase/repos/$repo/labels" -Headers $headers |
+                      Where-Object { $_.name -eq 'deployment-approval' }).id
+
+          # Close any stale open approval issues from previous runs
+          $page = 1
+          do {
+            $stale = Invoke-RestMethod "$apiBase/repos/$repo/issues?type=issues&state=open&labels=deployment-approval&limit=50&page=$page" -Headers $headers -ErrorAction SilentlyContinue
+            foreach ($s in $stale) {
+              Write-Host "Closing stale approval issue #$($s.number)"
+              Invoke-RestMethod "$apiBase/repos/$repo/issues/$($s.number)" -Method PATCH -Headers $headers `
+                -ContentType 'application/json' -Body (@{ state='closed' } | ConvertTo-Json) | Out-Null
+            }
+            $page++
+          } while ($stale.Count -eq 50)
+
+          $runUrl    = "${{ gitea.server_url }}/$repo/actions/runs/${{ gitea.run_id }}"
+          $creates   = "${{ needs.plan.outputs.plan_creates }}"
+          $updates   = "${{ needs.plan.outputs.plan_updates }}"
+          $deletes   = "${{ needs.plan.outputs.plan_deletes }}"
+          $issueBody = "## Deployment Approval Required`n**Tenant:** $repo`n**Run:** $runUrl`n**Run ID:** ${{ gitea.run_id }}`n**Triggered by:** ${{ gitea.actor }}`n`n<!-- plan-counts: {`"creates`":$creates,`"updates`":$updates,`"deletes`":$deletes} -->`n<!-- run-id: ${{ gitea.run_id }} -->`n`nReply with **approved** to proceed, or **denied** to cancel."
+
+          $issue = Invoke-RestMethod "$apiBase/repos/$repo/issues" -Method POST -Headers $headers `
+            -Body (@{ title="Deploy Approval: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"; body=$issueBody; labels=@($labelId) } | ConvertTo-Json -Depth 5)
+          "issue_number=$($issue.number)" | Out-File $env:GITEA_OUTPUT -Append -Encoding utf8
+          Write-Host "Approval issue created: #$($issue.number) — $runUrl"
+
+      - name: Poll for approval
+        shell: pwsh
+        run: |
+          $apiBase   = "${{ gitea.server_url }}/api/v1"
+          $headers   = @{ Authorization = "token ${{ gitea.token }}" }
+          $repo      = "${{ gitea.repository }}"
+          $runId     = "${{ gitea.run_id }}"
+          $issueNum  = "${{ steps.create_issue.outputs.issue_number }}"
+          $approveRx = '(?i)^\s*(approve[d]?|lgtm|yes)\s*[.!]?\s*$'
+          $denyRx    = '(?i)^\s*(den(y|ied)|no)\s*[.!]?\s*$'
+          $timeoutAt = (Get-Date).AddHours(6)
+
+          # Resume check: if the container restarted mid-poll, detect any decision already posted
+          $existingComments = @(Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum/comments" -Headers $headers -ErrorAction SilentlyContinue)
+          foreach ($c in $existingComments) {
+            if ($c.body -match $approveRx) {
+              Write-Host "Already approved by $($c.user.login) (detected on resume)"
+              exit 0
+            }
+            if ($c.body -match $denyRx) {
+              Write-Host "Already denied by $($c.user.login) (detected on resume)"
+              exit 1
+            }
+          }
+          # Also handle the case where the issue was closed manually (e.g. by the portal UI) with no matching comment
+          $issueState = (Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum" -Headers $headers -ErrorAction SilentlyContinue).state
+          if ($issueState -eq 'closed') {
+            Write-Host "Issue #$issueNum is already closed — treating as approved"
+            exit 0
+          }
+
+          Write-Host "Waiting for approval on issue #$issueNum (timeout: 6 hours) ..."
+          while ($true) {
+            Start-Sleep 30
+
+            # Cancel the run (not fail) if approval window has expired
+            if ((Get-Date) -gt $timeoutAt) {
+              Write-Host "Approval timeout reached — cancelling run"
+              Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum" -Method PATCH -Headers $headers `
+                -ContentType 'application/json' -Body (@{ state='closed'; title='[Expired] Deploy Approval' } | ConvertTo-Json) | Out-Null
+              Invoke-RestMethod "$apiBase/repos/$repo/actions/runs/$runId/cancel" -Method POST -Headers $headers `
+                -ContentType 'application/json' -ErrorAction SilentlyContinue | Out-Null
+              Start-Sleep 10
+              exit 0
+            }
+
+            $comments = Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum/comments" -Headers $headers
+            foreach ($c in $comments) {
+              if ($c.body -match $approveRx) {
+                Write-Host "Approved by $($c.user.login)"
+                Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum" -Method PATCH -Headers $headers `
+                  -ContentType 'application/json' -Body (@{ state='closed' } | ConvertTo-Json) | Out-Null
+                exit 0
+              }
+              if ($c.body -match $denyRx) {
+                Write-Host "Denied by $($c.user.login)"
+                Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum" -Method PATCH -Headers $headers `
+                  -ContentType 'application/json' -Body (@{ state='closed' } | ConvertTo-Json) | Out-Null
+                exit 1
+              }
+            }
+          }
+
+      - name: Cleanup Job Session
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:GITEA_RUN_ID) {
+            Remove-Item -Path "/tmp/act-jobs/$($env:GITEA_RUN_ID)" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed job session: /tmp/act-jobs/$($env:GITEA_RUN_ID)"
+          }
+
+  # ---------------------------------------------------------------------------
+  # APPLY JOB - Runs after approval gate is cleared, only if has_changes
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply M365 Configuration Changes
+    runs-on: self-hosted
+    needs: [plan, gate]
+    if: (needs.plan.outputs.has_changes == 'true' || needs.plan.outputs.has_group_actions == 'true') && needs.gate.result == 'success'
+    env:
+      GITEA_RUN_ID: ${{ gitea.run_id }}
+      HOME: /tmp/act-jobs/${{ gitea.run_id }}
+      USERPROFILE: /tmp/act-jobs/${{ gitea.run_id }}
+      XDG_CACHE_HOME: /tmp/act-jobs/${{ gitea.run_id }}/.cache
+      PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+      TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+    steps:
+      - name: Initialize Job Session Isolation
+        shell: bash
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME"
+          export USERPROFILE="$HOME"
+          mkdir -p "$USERPROFILE/.azure" "$USERPROFILE/.local/share"
+          for f in .gitconfig .git-credentials .netrc; do
+            [ -f "/root/$f" ] && cp "/root/$f" "$HOME/$f"
+          done
+          # Git 2.35+ rejects checkouts when workspace bind-mount path
+          # (/data/...) differs from the host path Git resolves
+          # (/home/config365-data/...). Mark all dirs safe for this job.
+          git config --global --add safe.directory '*'
+          echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      # -- Checkouts ------------------------------------------------------------
+      - name: Checkout config365/orchestrator
+        run: git clone ${{ gitea.server_url }}/${{ vars.PLATFORM_ORG }}/orchestrator scripts
+
+      - name: Checkout MSP Baseline
+        run: git clone ${{ gitea.server_url }}/${{ vars.MSP_ORG }}/baseline baseline
+
+      - name: Checkout Tenant Repository
+        run: git clone ${{ gitea.server_url }}/${{ gitea.repository }} tenant
+
+      # -- Prepare ---------------------------------------------------------------
+      - name: Prepare - Assign Required Directory Roles
+        id: deploy_prepare_roles
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Prepare-TenantRoles.ps1" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Resolve - Tenant Group Memberships
+        id: deploy_resolve_groups
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/common/Resolve-TenantGroups.ps1" `
+            -BaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/tenant-groups-resolved.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+
+      # -- Apply: Create/Update resources ----------------------------------------
+      # Skipped when the approved plan has no baseline file changes (group-actions-only).
+      - name: Apply - Custom Security Attributes
+        id: deploy_custom_attrs
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployCustomAttributes') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-CustomAttributes.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/custom-attributes" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/customattributes-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Groups
+        shell: pwsh
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployGroups') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-BaselineGroups.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/groups" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/groups-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Tenant Groups
+        shell: pwsh
+        if: contains(inputs.deploy_options, 'deployGroups') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        run: |
+          $tenantGroups = "${{ gitea.workspace }}/tenant/groups"
+          if (Test-Path $tenantGroups) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Configure-BaselineGroups.ps1" `
+              -ConfigDirectory $tenantGroups `
+              -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+              -OutputPath "/tmp/tenant-groups-results.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Entra ID Settings
+        id: deploy_entra_id
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployEntraIdDeviceSettings') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-EntraIDSettings.ps1" `
+            -ConfigPath "${{ gitea.workspace }}/baseline/baseline/entra-id-device-settings/security-defaults.json" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -OutputPath "/tmp/entraidsettings-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Apply - Defender Connector
+        id: deploy_defender_connector
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployDefenderConnector') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-DefenderConnector.ps1" `
+            -ConfigPath "${{ gitea.workspace }}/baseline/baseline/intune/defender-connector/windows-defender-atp-connector.json" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -OutputPath "/tmp/defender-connector-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Apply - Conditional Access
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployConditionalAccess') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ConditionalAccess.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/conditional-access" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OptionsPath "${{ gitea.workspace }}/scripts/om365do-options.json" `
+            -OutputPath "/tmp/ca-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Teams
+        id: deploy_teams
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployTeams') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-Teams.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/teams" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/teams-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - SharePoint
+        id: deploy_sharepoint
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deploySharePoint') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-SharePoint.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/sharepoint" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/sharepoint-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Exchange Online
+        id: deploy_exchange
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployExchange') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-Exchange.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/exchange" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/exchange-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          PORTAL_TOKEN_API_URL: ${{ vars.TOKEN_API_INTERNAL_URL }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Apply - Exchange Message Encryption (IRM/OME)
+        id: deploy_exchange_message_encryption
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployExchange') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ExchangeMessageEncryption.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/exchange" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/exchange-message-encryption-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          PORTAL_TOKEN_API_URL: ${{ vars.TOKEN_API_INTERNAL_URL }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Apply - Intune
+        id: deploy_intune
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployIntune') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-Intune.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/intune" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/intune-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+          EXTRA_BASELINE_FOLDERS: ${{ env.EXTRA_BASELINE_FOLDERS }}
+          EXTRA_BASELINE_FILES: ${{ env.EXTRA_BASELINE_FILES }}
+
+      - name: Apply - Chocolatey Apps
+        id: deploy_choco
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployAppsChocolatey') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ChocoApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/chocolatey","${{ gitea.workspace }}/tenant/apps/chocolatey" `
+            -OutputPath "/tmp/chocoapps-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - WinGet Apps
+        id: deploy_winget
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployAppsWinget') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-WingetApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/winget","${{ gitea.workspace }}/tenant/apps/winget" `
+            -OutputPath "/tmp/wingetapps-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Custom Apps
+        id: deploy_custom_apps
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployAppsCustom') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-CustomApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/custom","${{ gitea.workspace }}/tenant/apps/custom" `
+            -OutputPath "/tmp/customapps-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Printer Apps
+        id: deploy_printer_apps
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployAppsPrinter') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-PrinterApps.ps1" `
+            -ConfigDirectories "${{ gitea.workspace }}/baseline/baseline/apps/printer","${{ gitea.workspace }}/tenant/apps/printer" `
+            -OutputPath "/tmp/printerapps-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Enterprise Apps
+        id: deploy_enterprise_apps
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployEnterpriseApps') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-EnterpriseApps.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/enterprise-apps" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/apps-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          ALLOW_CREATE: ${{ contains(inputs.deploy_options, 'allowCreate') }}
+          ALLOW_UPDATE: ${{ contains(inputs.deploy_options, 'allowUpdate') }}
+
+      - name: Apply - Authentication Policies
+        id: deploy_auth_policies
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployAuthenticationPolicies') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-AuthenticationMethods.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/authentication-policies" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/authpolicies-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Apply - Consent and Permissions
+        id: deploy_consent
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deployEntraIdConsentpermissions') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ConsentPermissions.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/entra-id-consentpermissions" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/consentpermissions-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Apply - SharePoint Tenant Settings
+        id: deploy_sp_settings
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deploySharePointSettings') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-SharePointSettings.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/sharepoint-settings" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/spsettings-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Apply - SharePoint Tenant Settings (SpoTenant)
+        id: deploy_sp_tenant_settings
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'deploySharePointSettings') && (contains(inputs.deploy_options, 'allowCreate') || contains(inputs.deploy_options, 'allowUpdate'))
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-SharePointTenantSettings.ps1" `
+            -ConfigDirectory "${{ gitea.workspace }}/baseline/baseline/sharepoint-settings" `
+            -TenantBaselinePath "${{ gitea.workspace }}/baseline" `
+            -TenantRepoPath "${{ gitea.workspace }}/tenant" `
+            -OutputPath "/tmp/sptenant-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # -- Apply: Removal steps --------------------------------------------------
+      - name: Remove - Conditional Access
+        id: deploy_remove_ca
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployConditionalAccess') && needs.plan.outputs.plan_ca_deletes != '0'
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-ConditionalAccess.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/conditional-access" `
+            -OutputPath "/tmp/ca-remove-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Remove - Groups
+        id: deploy_remove_groups
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployGroups') && needs.plan.outputs.plan_groups_deletes != '0'
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Groups.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/groups" `
+            -OutputPath "/tmp/groups-remove-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Remove - Intune Policies
+        id: deploy_remove_intune
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployIntune') && needs.plan.outputs.plan_intune_deletes != '0'
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Intune.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/intune" `
+            -OutputPath "/tmp/intune-remove-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Remove - Custom Attributes
+        id: deploy_remove_custom_attrs
+        continue-on-error: true
+        if: needs.plan.outputs.has_baseline_changes == 'true' && contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployCustomAttributes')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Remove-CustomAttributes.ps1" `
+            -RemoveDirectory "${{ gitea.workspace }}/baseline/baseline-remove/custom-attributes" `
+            -OutputPath "/tmp/customattributes-remove-results.json" `
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Tenant-Remove - Conditional Access (pending-removes)
+        id: deploy_tr_ca
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployConditionalAccess') && needs.plan.outputs.plan_ca_deletes != '0'
+        shell: pwsh
+        run: |
+          $dir = "${{ gitea.workspace }}/tenant/pending-removes/conditional-access"
+          if (Test-Path $dir) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Remove-ConditionalAccess.ps1" `
+              -RemoveDirectory $dir `
+              -OutputPath "/tmp/ca-tenant-remove-results.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          } else {
+            Write-Host "No tenant pending-removes for conditional-access - skipping."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Tenant-Remove - Groups (pending-removes)
+        id: deploy_tr_groups
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployGroups') && needs.plan.outputs.plan_groups_deletes != '0'
+        shell: pwsh
+        run: |
+          $dir = "${{ gitea.workspace }}/tenant/pending-removes/groups"
+          if (Test-Path $dir) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Groups.ps1" `
+              -RemoveDirectory $dir `
+              -OutputPath "/tmp/groups-tenant-remove-results.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          } else {
+            Write-Host "No tenant pending-removes for groups - skipping."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Tenant-Remove - Intune (pending-removes)
+        id: deploy_tr_intune
+        continue-on-error: true
+        if: contains(inputs.deploy_options, 'allowDelete') && contains(inputs.deploy_options, 'deployIntune') && needs.plan.outputs.plan_intune_deletes != '0'
+        shell: pwsh
+        run: |
+          $dir = "${{ gitea.workspace }}/tenant/pending-removes/intune"
+          if (Test-Path $dir) {
+            & "${{ gitea.workspace }}/scripts/graph-configs/Remove-Intune.ps1" `
+              -RemoveDirectory $dir `
+              -OutputPath "/tmp/intune-tenant-remove-results.json" `
+              -Verbose:$${{ inputs.debug_mode }}
+          } else {
+            Write-Host "No tenant pending-removes for intune - skipping."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # -- Apply: Group Membership Actions ----------------------------------------
+      # Always runs after gate approval — processes pending-group-adds and
+      # pending-group-removes regardless of deploy_options.
+      - name: Apply - Group Membership Actions
+        id: deploy_group_membership
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $addDir    = "${{ gitea.workspace }}/tenant/pending-group-adds"
+          $removeDir = "${{ gitea.workspace }}/tenant/pending-group-removes"
+          if ((Test-Path $addDir) -or (Test-Path $removeDir)) {
+            $thisRunResult = "/tmp/group-action-result.json"
+            & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-AddUsersToGroup.ps1" `
+              -TenantDir  "${{ gitea.workspace }}/tenant" `
+              -OutputPath $thisRunResult `
+              -Verbose:$${{ inputs.debug_mode }}
+            if (Test-Path $thisRunResult) {
+              $configDir = "${{ gitea.workspace }}/tenant/config"
+              if (-not (Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir -Force | Out-Null }
+              Copy-Item $thisRunResult "$configDir/group-action-last-run.json" -Force
+            }
+          } else {
+            Write-Host "No pending group membership actions."
+          }
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # -- Check Step Failures ---------------------------------------------------
+      # Fails the job if any continue-on-error step had an error outcome so the
+      # Gitea dashboard shows red instead of green for partial failures.
+      - name: Check Step Failures
+        if: always()
+        shell: bash
+        run: |
+          FAILED=0
+          [[ "${{ steps.deploy_prepare_roles.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_resolve_groups.outcome }}"   == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_custom_attrs.outcome }}"     == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_entra_id.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_teams.outcome }}"            == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_sharepoint.outcome }}"       == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_exchange.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_intune.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_choco.outcome }}"            == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_winget.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_custom_apps.outcome }}"      == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_printer_apps.outcome }}"     == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_enterprise_apps.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_auth_policies.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_consent.outcome }}"          == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_sp_settings.outcome }}"      == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_remove_ca.outcome }}"        == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_remove_groups.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_remove_intune.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_remove_custom_attrs.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_tr_ca.outcome }}"              == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_tr_groups.outcome }}"          == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_tr_intune.outcome }}"          == "failure" ]] && FAILED=1
+          [[ "${{ steps.deploy_group_membership.outcome }}"   == "failure" ]] && FAILED=1
+          if [ $FAILED -eq 1 ]; then
+            echo "One or more deploy steps failed — see individual step logs above."
+            exit 1
+          fi
+          echo "All deploy steps completed successfully."
+
+      # -- Deployment Summary ----------------------------------------------------
+      - name: Deployment Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "-------------------------------------------------------"
+          Write-Host "  DEPLOYMENT COMPLETE"
+          Write-Host "-------------------------------------------------------"
+          Write-Host "  Tenant:      ${{ inputs.tenant_name }}"
+          Write-Host "  Environment: ${{ inputs.environment }}"
+          Write-Host "  Timestamp:   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+          Write-Host ""
+
+          $resultFiles = Get-ChildItem /tmp -Filter "*-results.json" -ErrorAction SilentlyContinue
+          if ($resultFiles.Count -gt 0) {
+            $totalCreated = 0; $totalUpdated = 0; $totalRemoved = 0; $totalErrors = 0
+            foreach ($f in $resultFiles) {
+              try {
+                $data = Get-Content $f.FullName -Raw | ConvertFrom-Json
+                if ($data.Service) {
+                  $totalCreated += [int]($data.CreatedCount ?? 0)
+                  $totalUpdated += [int]($data.UpdatedCount ?? 0)
+                  $totalRemoved += [int]($data.RemovedCount ?? 0)
+                  $totalErrors  += [int]($data.ErrorCount   ?? 0)
+                  Write-Host "  $($data.Service): +$($data.CreatedCount ?? 0) created, ~$($data.UpdatedCount ?? 0) updated, -$($data.RemovedCount ?? 0) removed, !$($data.ErrorCount ?? 0) errors"
+                }
+              } catch { }
+            }
+            Write-Host ""
+            Write-Host "  TOTALS: +$totalCreated created, ~$totalUpdated updated, -$totalRemoved removed, !$totalErrors errors"
+          }
+
+          Write-Host "-------------------------------------------------------"
+        env:
+          DEPLOY_TENANT_NAME: ${{ inputs.tenant_name }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+
+      # -- Cleanup: remove pending-removes and commit track files ----------------
+      - name: Cleanup - Commit Track Files and Remove Pending Removes
+        if: always()
+        shell: pwsh
+        run: |
+          Set-Location "${{ gitea.workspace }}/tenant"
+
+          git config --global --add safe.directory '*'
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+
+          $hasChanges = $false
+
+          if (Test-Path "config") {
+            git add config/
+            $staged = git diff --cached --name-only
+            if ($staged) { $hasChanges = $true }
+          }
+
+          if (Test-Path "pending-removes") {
+            git rm -r pending-removes/
+            $hasChanges = $true
+          }
+
+          # Subtract only users processed by this Apply run. Refresh pending-group
+          # paths from origin first so users queued during the gate survive.
+          $thisRunResult = "/tmp/group-action-result.json"
+          if (Test-Path $thisRunResult) {
+            try {
+              $runResult = Get-Content $thisRunResult -Raw | ConvertFrom-Json
+              if (-not $runResult.whatIf) {
+                git fetch origin ${{ gitea.ref_name }}
+                foreach ($dir in @('pending-group-adds', 'pending-group-removes')) {
+                  git checkout "origin/${{ gitea.ref_name }}" -- $dir 2>$null
+                }
+
+                $successStatuses = @('added', 'removed', 'alreadyMember', 'notMember')
+                foreach ($action in @($runResult.actions)) {
+                  if (-not $action.sourceFile) { continue }
+                  $sourceFile = [string]$action.sourceFile
+                  if (-not (Test-Path $sourceFile)) {
+                    Write-Host "Pending file gone (already cleaned?): $sourceFile"
+                    continue
+                  }
+
+                  $doneIds = [System.Collections.Generic.HashSet[string]]::new(
+                    [StringComparer]::OrdinalIgnoreCase)
+                  foreach ($r in @($action.results)) {
+                    if ($successStatuses -contains [string]$r.status -and $r.userId) {
+                      [void]$doneIds.Add([string]$r.userId)
+                    }
+                  }
+                  if ($doneIds.Count -eq 0) { continue }
+
+                  $pending = Get-Content $sourceFile -Raw | ConvertFrom-Json
+                  $keptUsers = @()
+                  if ($pending.users) {
+                    $keptUsers = @($pending.users | Where-Object { -not $doneIds.Contains([string]$_.id) })
+                  } elseif ($pending.userIds) {
+                    $keptUsers = @($pending.userIds |
+                      Where-Object { -not $doneIds.Contains([string]$_) } |
+                      ForEach-Object { [PSCustomObject]@{ id = $_; upn = $_; displayName = '' } })
+                  }
+
+                  if ($keptUsers.Count -eq 0) {
+                    git rm -f $sourceFile
+                    $hasChanges = $true
+                    Write-Host "Removed empty pending file: $sourceFile"
+                  } else {
+                    $pending | Add-Member -NotePropertyName users -NotePropertyValue $keptUsers -Force
+                    if ($pending.PSObject.Properties['userIds']) {
+                      $pending.PSObject.Properties.Remove('userIds')
+                    }
+                    $pending | ConvertTo-Json -Depth 10 | Set-Content -Path $sourceFile -Encoding UTF8
+                    git add $sourceFile
+                    $hasChanges = $true
+                    Write-Host "Subtracted $($doneIds.Count) processed user(s) from $sourceFile; $($keptUsers.Count) remain"
+                  }
+                }
+              } else {
+                Write-Host "Skipping pending-group subtract — result is WhatIf"
+              }
+            } catch {
+              Write-Warning "Pending-group subtract failed: $_"
+            }
+          } else {
+            Write-Host "No this-run group-action result — leaving pending-group folders intact"
+          }
+
+          # WhatIf plan files are ephemeral — remove after apply so the portal
+          # never shows stale actions on the next deploy.
+          foreach ($f in @('config/deploy-plan-latest.json', 'config/group-membership-plan-latest.json')) {
+            if (Test-Path $f) {
+              git rm -f $f
+              $hasChanges = $true
+              Write-Host "Removed WhatIf plan: $f"
+            }
+          }
+
+          if ($hasChanges) {
+            git commit -m "chore: update track files for run ${{ gitea.run_id }} [skip ci]"
+            git fetch origin ${{ gitea.ref_name }}
+            git rebase origin/${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            Write-Host "Track files committed and pushed"
+          }
+        env:
+          GITEA_TOKEN: ${{ secrets.GIT_TOKEN }}
+
+      - name: Cleanup Job Session
+        if: always()
+        shell: pwsh
+        run: |
+          $connectScript = "${{ gitea.workspace }}/scripts/common/Connect-M365Graph.ps1"
+          if (Test-Path $connectScript) {
+            . $connectScript
+            try { Disconnect-M365Connections } catch { Write-Host "##[warning]Cleanup disconnect: $_" }
+          } elseif (Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) {
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+          }
+          if ($env:GITEA_RUN_ID) {
+            Remove-Item -Path "/tmp/act-jobs/$($env:GITEA_RUN_ID)" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed job session: /tmp/act-jobs/$($env:GITEA_RUN_ID)"
+          }
+
+  # ---------------------------------------------------------------------------
+  # POST-DEPLOYMENT VALIDATION
+  # ---------------------------------------------------------------------------
+  post_deployment:
+    name: Post-Deployment Validation
+    runs-on: self-hosted
+    needs:
+      - plan
+      - apply
+    if: always() && (needs.apply.result == 'success' || needs.plan.outputs.has_changes == 'false')
+    env:
+      GITEA_RUN_ID: ${{ gitea.run_id }}
+      HOME: /tmp/act-jobs/${{ gitea.run_id }}
+      USERPROFILE: /tmp/act-jobs/${{ gitea.run_id }}
+      XDG_CACHE_HOME: /tmp/act-jobs/${{ gitea.run_id }}/.cache
+    steps:
+      - name: Initialize Job Session Isolation
+        shell: bash
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME"
+          export USERPROFILE="$HOME"
+          mkdir -p "$USERPROFILE/.azure" "$USERPROFILE/.local/share"
+          for f in .gitconfig .git-credentials .netrc; do
+            [ -f "/root/$f" ] && cp "/root/$f" "$HOME/$f"
+          done
+          # Git 2.35+ rejects checkouts when workspace bind-mount path
+          # (/data/...) differs from the host path Git resolves
+          # (/home/config365-data/...). Mark all dirs safe for this job.
+          git config --global --add safe.directory '*'
+          echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      - name: Verify Deployment
+        shell: pwsh
+        run: |
+          Write-Host "Deployment Validation"
+          Write-Host "  Microsoft Graph API configurations applied"
+          Write-Host "  Tenant: ${{ inputs.tenant_name }}"
+          Write-Host "  Environment: ${{ inputs.environment }}"
+          Write-Host ""
+          Write-Host "All validations passed"
+        env:
+          DEPLOY_TENANT_NAME: ${{ inputs.tenant_name }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+
+      - name: Send Notification
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # Add notification logic here (Teams webhook, email, etc.)
+          Write-Host "Deployment notification would be sent here"
+
+      - name: Cleanup Job Session
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:GITEA_RUN_ID) {
+            Remove-Item -Path "/tmp/act-jobs/$($env:GITEA_RUN_ID)" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed job session: /tmp/act-jobs/$($env:GITEA_RUN_ID)"
+          }

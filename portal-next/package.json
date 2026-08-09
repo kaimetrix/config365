@@ -1,0 +1,52 @@
+{
+  "name": "config365-portal",
+  "version": "1.1.2",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test lib/mailbox-audit-drift.test.ts"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.5.0",
+    "@azure/keyvault-secrets": "^4.9.0",
+    "@azure/storage-blob": "^12.26.0",
+    "@radix-ui/react-dialog": "^1.1.0",
+    "@radix-ui/react-dropdown-menu": "^2.1.0",
+    "@radix-ui/react-label": "^2.1.0",
+    "@radix-ui/react-select": "^2.1.0",
+    "@radix-ui/react-slot": "^1.1.0",
+    "@radix-ui/react-tabs": "^1.1.0",
+    "@radix-ui/react-toast": "^1.2.0",
+    "adm-zip": "^0.5.17",
+    "better-sqlite3": "^11.0.0",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.0",
+    "iron-session": "^8.0.4",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.447.0",
+    "mssql": "^11.0.1",
+    "next": "^15.5.18",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "server-only": "^0.0.1",
+    "swr": "^2.2.0",
+    "tailwind-merge": "^2.4.0",
+    "tailwindcss": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/mssql": "^9.1.5",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "odataWildcard": true,
+  "fields": [
+    "id",
+    "sourceId",
+    "createdDateTime",
+    "lastModifiedDateTime",
+    "modifiedDateTime",
+    "deletedDateTime",
+    "@odata.context",
+    "@odata.type",
+    "version",
+    "creationSource",
+    "_sourceFile",
+    "_SourceFile",
+    "_sourcePath",
+    "_MapKey",
+    "_PolicyDisplayName",
+    "_policyType",
+    "_assignments",
+    "_settings",
+    "_monitorConfig"
+  ]
+}

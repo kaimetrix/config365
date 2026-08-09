@@ -1,0 +1,29 @@
+# Ad-hoc test stack for the publicly published GHCR preview image.
+# Runs fully isolated from the main dev stack (docker-compose.yml):
+#   - separate container name, port, and named volume
+#   - pulls ghcr.io/potsolutions/config365-preview instead of building locally
+#
+# Usage:
+#   docker compose -f docker-compose.preview-test.yml up -d
+#   docker compose -f docker-compose.preview-test.yml down -v   # tear down + wipe test volume
+
+services:
+  config365-preview-test:
+    image: ghcr.io/potsolutions/config365-preview:${CONFIG365_IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: config365-preview-test
+    ports:
+      - "8081:80"
+    environment:
+      PORTAL_HTTP_PORT: 8081
+      GITEA_ORG: config365
+      GITEA_RUNNER_NAME: config365-preview-test-runner
+      RUNNER_SHARDS: 4
+      SECURE_COOKIES: "false"
+    volumes:
+      - config365-preview-test-data:/home/config365-data
+    restart: unless-stopped
+
+volumes:
+  config365-preview-test-data:
+    name: config365-preview-test-data

@@ -1,0 +1,498 @@
+# Config365 - Nightly Tenant Maintenance Pipeline
+#
+# This file is the canonical template stored in config365/orchestrator.
+# Tenant repos contain an identical copy at .gitea/workflows/maintenance.yml.
+# The "Sync pipeline" step keeps them in sync automatically - changes here
+# apply to all tenants on their next run.
+#
+# Required org-level secrets (MSP Gitea org -- available via secrets: inherit):
+#   PORTAL_INTERNAL_KEY   - Shared secret for the internal token API (Gitea masks it)
+#
+# Required repo-level vars (set per tenant):
+#   TENANT_SLUG           - Tenant identifier matching the Config365 database slug
+#
+# Optional secrets (Exchange Online):
+#   EXCHANGE_ORG          - Exchange Online org name
+#
+# NOTE: CLIENT_ID, CLIENT_SECRET, TENANT_ID are no longer used.
+# Connect-M365Graph.ps1 fetches delegated tokens from the token API (PORTAL_TOKEN_API_URL, defaults to http://localhost:4322).
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 4 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      tenant_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Tenant name (for identification, defaults to repo name)'
+      debug_mode:
+        required: false
+        type: boolean
+        default: false
+        description: 'Enable verbose output for troubleshooting'
+      what_if:
+        required: false
+        type: boolean
+        default: false
+        description: 'Preview mode - show changes without applying them'
+      maintenance_tasks:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated task keywords to run - empty means all (nightly default). Keywords: groupSplits,exchangeFonts,exchangeGal,intuneDeviceRename,intunePrimaryUser,entraDeviceCleanup,baselineApplyCleanup'
+
+concurrency:
+  group: maintenance-${{ gitea.repository }}
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    name: Nightly Tenant Maintenance
+    runs-on: self-hosted
+    env:
+      GITEA_RUN_ID: ${{ gitea.run_id }}
+      HOME: /tmp/act-jobs/${{ gitea.run_id }}
+      USERPROFILE: /tmp/act-jobs/${{ gitea.run_id }}
+      XDG_CACHE_HOME: /tmp/act-jobs/${{ gitea.run_id }}/.cache
+      PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+      TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+    steps:
+      - name: Initialize Job Session Isolation
+        shell: bash
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME"
+          export USERPROFILE="$HOME"
+          mkdir -p "$USERPROFILE/.azure" "$USERPROFILE/.local/share"
+          for f in .gitconfig .git-credentials .netrc; do
+            [ -f "/root/$f" ] && cp "/root/$f" "$HOME/$f"
+          done
+          # Git 2.35+ rejects checkouts when workspace bind-mount path
+          # (/data/...) differs from the host path Git resolves
+          # (/home/config365-data/...). Mark all dirs safe for this job.
+          git config --global --add safe.directory '*'
+          echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      # ── Checkout ────────────────────────────────────────────────────────────────
+      - name: Checkout Tenant Repository
+        run: git clone ${{ gitea.server_url }}/${{ gitea.repository }} tenant
+
+      - name: Checkout config365/orchestrator
+        run: git clone ${{ gitea.server_url }}/${{ vars.PLATFORM_ORG }}/orchestrator scripts
+
+      - name: Checkout MSP Baseline
+        run: git clone ${{ gitea.server_url }}/${{ vars.MSP_ORG }}/baseline baseline
+
+      # ── Sync pipeline from orchestrator ─────────────────────────────────────────
+      # Compares the orchestrator's maintenance-pipeline.yml with this tenant's
+      # maintenance.yml. If they differ, updates maintenance.yml and commits so
+      # the next run automatically picks up any pipeline changes.
+      - name: Sync pipeline from orchestrator
+        run: |
+          orch_file="${{ gitea.workspace }}/scripts/.gitea/workflows/maintenance-pipeline.yml"
+          tenant_file="${{ gitea.workspace }}/tenant/.gitea/workflows/maintenance.yml"
+          if ! cmp -s "$orch_file" "$tenant_file"; then
+            echo "Pipeline differs from orchestrator - syncing..."
+            cp "$orch_file" "$tenant_file"
+            cd "${{ gitea.workspace }}/tenant"
+            git config --global --add safe.directory '*'
+            git config user.email "config365-bot@config365.local"
+            git config user.name  "Config365 Bot"
+            git add .gitea/workflows/maintenance.yml
+            git commit -m "sync: update pipeline from config365/orchestrator"
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            echo "Pipeline synced. New steps will apply on next run."
+          else
+            echo "Pipeline is up to date."
+          fi
+
+      # ── Read Schedule Modes ──────────────────────────────────────────────────────
+      # Reads maintenance-schedule.json from the tenant config (falling back to
+      # baseline). Each task can be tagged auto (nightly only), manual (explicit
+      # trigger only), or both (always). The nightly schedule skips manual tasks;
+      # an explicit trigger always runs selected tasks regardless of tag.
+      - name: Read Schedule Modes
+        id: read_modes
+        shell: bash
+        run: |
+          TENANT_FILE="${{ gitea.workspace }}/tenant/config/maintenance/maintenance-schedule.json"
+          BASELINE_FILE="${{ gitea.workspace }}/baseline/maintenance/maintenance-schedule.json"
+
+          # Pick the most specific file available
+          if [ -f "$TENANT_FILE" ]; then
+            SCHEDULE_FILE="$TENANT_FILE"
+          elif [ -f "$BASELINE_FILE" ]; then
+            SCHEDULE_FILE="$BASELINE_FILE"
+          else
+            SCHEDULE_FILE=""
+          fi
+
+          read_mode() {
+            local key="$1"
+            if [ -n "$SCHEDULE_FILE" ]; then
+              jq -r --arg k "$key" '.[$k] // "both"' "$SCHEDULE_FILE" 2>/dev/null || echo "both"
+            else
+              echo "both"
+            fi
+          }
+
+          echo "group_splits=$(read_mode groupSplits)"                   >> "$GITHUB_OUTPUT"
+          echo "exchange_fonts=$(read_mode exchangeFonts)"               >> "$GITHUB_OUTPUT"
+          echo "exchange_gal=$(read_mode exchangeGal)"                   >> "$GITHUB_OUTPUT"
+          echo "intune_device_rename=$(read_mode intuneDeviceRename)"    >> "$GITHUB_OUTPUT"
+          echo "intune_primary_user=$(read_mode intunePrimaryUser)"      >> "$GITHUB_OUTPUT"
+          echo "entra_device_cleanup=$(read_mode entraDeviceCleanup)"    >> "$GITHUB_OUTPUT"
+          echo "baseline_apply_cleanup=$(read_mode baselineApplyCleanup)" >> "$GITHUB_OUTPUT"
+
+      # ── Prepare ─────────────────────────────────────────────────────────────────
+      - name: Prepare - Assign Required Directory Roles
+        id: step_prepare_roles
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Prepare-TenantRoles.ps1" `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 1. Group Split Rebalancing ───────────────────────────────────────────────
+      - name: Maintenance - Group Split Rebalancing
+        id: step_group_splits
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'groupSplits')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.group_splits != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-MaintenanceGroupSplits.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantName        "${{ inputs.tenant_name }}" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 2. Exchange Default Font Configuration ───────────────────────────────────
+      - name: Maintenance - Exchange Font Configuration
+        id: step_exchange_fonts
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'exchangeFonts')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.exchange_fonts != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ExchangeFonts.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantName        "${{ inputs.tenant_name }}" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/exchange-fonts-last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # ── 3. Exchange GAL Visibility ───────────────────────────────────────────────
+      - name: Maintenance - Exchange GAL Visibility
+        id: step_exchange_gal
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'exchangeGal')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.exchange_gal != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Configure-ExchangeGalHide.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantName        "${{ inputs.tenant_name }}" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/exchange-gal-hide-last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # ── 4. Intune Device Auto-Rename ─────────────────────────────────────────────
+      - name: Maintenance - Intune Device Auto-Rename
+        id: step_intune_rename
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'intuneDeviceRename')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.intune_device_rename != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-IntuneDeviceRename.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantName        "${{ inputs.tenant_name }}" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/intune-device-rename-last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 5. Intune Primary User Auto-Assignment ───────────────────────────────────
+      - name: Maintenance - Intune Primary User Auto-Assignment
+        id: step_intune_primary_user
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'intunePrimaryUser')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.intune_primary_user != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-IntuneAssignPrimaryUser.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantName        "${{ inputs.tenant_name }}" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/intune-primary-user-last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 6. Entra ID Inactive Device Cleanup ─────────────────────────────────────
+      - name: Maintenance - Entra ID Device Cleanup
+        id: step_entra_device_cleanup
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'entraDeviceCleanup')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.entra_device_cleanup != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-EntraDeviceCleanup.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantName        "${{ inputs.tenant_name }}" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/entra-device-cleanup-last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 7. Baseline Apply Scope File Cleanup ────────────────────────────────────
+      - name: Maintenance - Baseline Apply Scope Cleanup
+        id: step_baseline_apply_cleanup
+        continue-on-error: true
+        if: (inputs.maintenance_tasks == '' || contains(inputs.maintenance_tasks, 'baselineApplyCleanup')) && (gitea.event_name != 'schedule' || steps.read_modes.outputs.baseline_apply_cleanup != 'manual')
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Invoke-BaselineApplyCleanup.ps1" `
+            -BaselineConfigDir "${{ gitea.workspace }}/baseline/maintenance" `
+            -TenantConfigDir   "${{ gitea.workspace }}/tenant/config/maintenance" `
+            -TenantRepoPath    "${{ gitea.workspace }}/tenant" `
+            -OutputPath        "${{ gitea.workspace }}/tenant/config/maintenance/baseline-apply-cleanup-last-run.json" `
+            -WhatIfMode:$${{ inputs.what_if || false }} `
+            -Verbose:$${{ inputs.debug_mode || false }}
+
+      # ── Collect WhatIf Results ───────────────────────────────────────────────────
+      # Runs only in WhatIf mode. Merges all per-task output JSONs into a single
+      # whatif-latest.json and commits it so the portal can read and display it.
+      - name: Collect WhatIf Results
+        if: ${{ inputs.what_if }}
+        shell: bash
+        run: |
+          WORKSPACE="${{ gitea.workspace }}"
+          MAINT_DIR="$WORKSPACE/tenant/config/maintenance"
+          GENERATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          TENANT="${{ inputs.tenant_name }}"
+          if [ -z "$TENANT" ]; then
+            TENANT="${{ gitea.repository }}"
+          fi
+
+          read_task_output() {
+            local file="$1"
+            if [ -f "$file" ]; then
+              cat "$file" 2>/dev/null || echo 'null'
+            else
+              echo 'null'
+            fi
+          }
+
+          # Build tasks array — only include tasks that were configured to run
+          TASKS_JSON="["
+          FIRST=1
+
+          append_task() {
+            local keyword="$1" label="$2" file="$3" step_outcome="$4"
+            local output
+            output=$(read_task_output "$file")
+            local status="skipped"
+            if [ "$step_outcome" = "success" ]; then status="success"; fi
+            if [ "$step_outcome" = "failure" ]; then status="failure"; fi
+            if [ "$FIRST" = "1" ]; then FIRST=0; else TASKS_JSON="$TASKS_JSON,"; fi
+            TASKS_JSON="$TASKS_JSON{\"keyword\":\"$keyword\",\"label\":\"$label\",\"status\":\"$status\",\"output\":$output}"
+          }
+
+          append_task "groupSplits"          "Group Split Rebalancing"          "$MAINT_DIR/last-run.json"                            "${{ steps.step_group_splits.outcome }}"
+          append_task "exchangeFonts"        "Exchange Default Font"            "$MAINT_DIR/exchange-fonts-last-run.json"             "${{ steps.step_exchange_fonts.outcome }}"
+          append_task "exchangeGal"          "Exchange GAL Visibility"          "$MAINT_DIR/exchange-gal-hide-last-run.json"          "${{ steps.step_exchange_gal.outcome }}"
+          append_task "intuneDeviceRename"   "Intune Device Auto-Rename"        "$MAINT_DIR/intune-device-rename-last-run.json"       "${{ steps.step_intune_rename.outcome }}"
+          append_task "intunePrimaryUser"    "Intune Primary User Assignment"   "$MAINT_DIR/intune-primary-user-last-run.json"        "${{ steps.step_intune_primary_user.outcome }}"
+          append_task "entraDeviceCleanup"   "Entra ID Device Cleanup"          "$MAINT_DIR/entra-device-cleanup-last-run.json"       "${{ steps.step_entra_device_cleanup.outcome }}"
+          append_task "baselineApplyCleanup" "Baseline Apply Scope Cleanup"     "$MAINT_DIR/baseline-apply-cleanup-last-run.json"   "${{ steps.step_baseline_apply_cleanup.outcome }}"
+
+          TASKS_JSON="$TASKS_JSON]"
+
+          COMBINED="{\"generatedAt\":\"$GENERATED_AT\",\"tenant\":\"$TENANT\",\"runId\":\"${{ gitea.run_id }}\",\"whatIf\":true,\"tasks\":$TASKS_JSON}"
+
+          mkdir -p "$MAINT_DIR"
+          echo "$COMBINED" | python3 -m json.tool --indent 2 > "$MAINT_DIR/whatif-latest.json" 2>/dev/null || echo "$COMBINED" > "$MAINT_DIR/whatif-latest.json"
+
+          cd "$WORKSPACE/tenant"
+          git config --global --add safe.directory '*'
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+          git add config/maintenance/whatif-latest.json
+          if git diff --cached --quiet; then
+            echo "No WhatIf output to commit."
+          else
+            git commit -m "maintenance whatif: $GENERATED_AT [skip ci] -- Run ID: ${{ gitea.run_id }}"
+            git pull --rebase --autostash origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            echo "WhatIf results committed."
+          fi
+
+      # ── Commit all write-backs in one push ──────────────────────────────────────
+      - name: Commit Write-backs
+        if: ${{ !inputs.what_if }}
+        shell: pwsh
+        run: |
+          Set-Location "${{ gitea.workspace }}/tenant"
+
+          git config --global --add safe.directory '*'
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+
+          git add config/maintenance/
+
+          $status = git status --porcelain
+          if ($status) {
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $prefix    = if ("${{ gitea.event_name }}" -eq 'schedule') { 'Scheduled maintenance' } else { 'Maintenance' }
+
+            # Build per-task change summary to embed in the commit message
+            $dir   = "config/maintenance"
+            $parts = [System.Collections.Generic.List[string]]::new()
+
+            function Get-RunJson($p) {
+              if (Test-Path $p) { try { return Get-Content $p -Raw | ConvertFrom-Json } catch {} }
+              return $null
+            }
+
+            $d = Get-RunJson "$dir/last-run.json"
+            if ($d -and $d.Results) {
+              $adds = ($d.Results | Measure-Object -Property Adds    -Sum).Sum
+              $rems = ($d.Results | Measure-Object -Property Removes -Sum).Sum
+              if (($adds + $rems) -gt 0) { $parts.Add("Group Splits: +$adds/-$rems members") }
+            }
+
+            $d = Get-RunJson "$dir/exchange-fonts-last-run.json"
+            if ($d -and $d.Results) {
+              $n = ($d.Results | Where-Object { $_.Status -notin @('Skipped','NoChange','NoMailbox') }).Count
+              if ($n -gt 0) { $parts.Add("Fonts: $n mailboxes") }
+            }
+
+            $d = Get-RunJson "$dir/exchange-gal-hide-last-run.json"
+            if ($d -and $d.Results) {
+              $n = ($d.Results | Where-Object { $_.Status -notin @('Skipped','NoChange','NoMailbox') }).Count
+              if ($n -gt 0) { $parts.Add("GAL: $n mailboxes") }
+            }
+
+            $d = Get-RunJson "$dir/intune-device-rename-last-run.json"
+            if ($d -and $d.Results) {
+              $n = ($d.Results | Measure-Object -Property Renamed -Sum).Sum
+              if ($n -gt 0) { $parts.Add("Renamed: $n devices") }
+            }
+
+            $d = Get-RunJson "$dir/intune-primary-user-last-run.json"
+            if ($d -and $d.Results) {
+              $n = ($d.Results | Where-Object { $_.Status -eq 'Assigned' }).Count
+              if ($n -gt 0) { $parts.Add("Primary User: $n assigned") }
+            }
+
+            $d = Get-RunJson "$dir/entra-device-cleanup-last-run.json"
+            if ($d -and $d.DeletedCount -gt 0) { $parts.Add("Entra Cleanup: $($d.DeletedCount) deleted") }
+
+            $d = Get-RunJson "$dir/baseline-apply-cleanup-last-run.json"
+            if ($d -and $d.RemovedCount -gt 0) { $parts.Add("Apply Scope Cleanup: $($d.RemovedCount) removed") }
+
+            $summary = if ($parts.Count -gt 0) { " | " + ($parts -join " | ") } else { "" }
+
+            git commit -m "$prefix write-back: $timestamp$summary [skip ci]`n`nRun ID: ${{ gitea.run_id }}"
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            Write-Host "Write-backs committed and pushed"
+          } else {
+            Write-Host "No write-backs to commit"
+          }
+
+      # ── Check Step Failures ──────────────────────────────────────────────────────
+      # Fails the job if any continue-on-error step had an error outcome so the
+      # Gitea dashboard shows red instead of green for partial failures.
+      - name: Check Step Failures
+        if: always()
+        shell: bash
+        run: |
+          FAILED=0
+          [[ "${{ steps.step_prepare_roles.outcome }}"      == "failure" ]] && FAILED=1
+          [[ "${{ steps.read_modes.outcome }}"              == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_group_splits.outcome }}"       == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_exchange_fonts.outcome }}"     == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_exchange_gal.outcome }}"       == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_intune_rename.outcome }}"      == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_intune_primary_user.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_entra_device_cleanup.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_baseline_apply_cleanup.outcome }}" == "failure" ]] && FAILED=1
+          if [ $FAILED -eq 1 ]; then
+            echo "One or more maintenance steps failed — see individual step logs above."
+            exit 1
+          fi
+          echo "All maintenance steps completed successfully."
+
+      # ── Summary ──────────────────────────────────────────────────────────────────
+      - name: Maintenance Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== Nightly Maintenance Summary ==="
+          Write-Host "Tenant    : ${{ inputs.tenant_name }}"
+          Write-Host "Run Date  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "Run ID    : ${{ gitea.run_id }}"
+          Write-Host "Event     : ${{ gitea.event_name }}"
+          Write-Host "WhatIf    : ${{ inputs.what_if }}"
+          Write-Host "Tasks     : $(if ('${{ inputs.maintenance_tasks }}') { '${{ inputs.maintenance_tasks }}' } else { 'all' })"
+          Write-Host ""
+          Write-Host "Schedule modes:"
+          Write-Host "  groupSplits        : ${{ steps.read_modes.outputs.group_splits }}"
+          Write-Host "  exchangeFonts      : ${{ steps.read_modes.outputs.exchange_fonts }}"
+          Write-Host "  exchangeGal        : ${{ steps.read_modes.outputs.exchange_gal }}"
+          Write-Host "  intuneDeviceRename : ${{ steps.read_modes.outputs.intune_device_rename }}"
+          Write-Host "  intunePrimaryUser      : ${{ steps.read_modes.outputs.intune_primary_user }}"
+          Write-Host "  entraDeviceCleanup     : ${{ steps.read_modes.outputs.entra_device_cleanup }}"
+          Write-Host "  baselineApplyCleanup   : ${{ steps.read_modes.outputs.baseline_apply_cleanup }}"
+          Write-Host ""
+          Write-Host "Tasks completed:"
+          Write-Host "  1  - Group Split Rebalancing"
+          Write-Host "  2  - Exchange Default Font Configuration"
+          Write-Host "  3  - Exchange GAL Visibility"
+          Write-Host "  4  - Intune Device Auto-Rename"
+          Write-Host "  5  - Intune Primary User Auto-Assignment"
+          Write-Host "  6  - Entra ID Device Cleanup"
+          Write-Host "  7  - Baseline Apply Scope Cleanup"
+          Write-Host "==================================="
+
+      - name: Cleanup Job Session
+        if: always()
+        shell: pwsh
+        run: |
+          $connectScript = "${{ gitea.workspace }}/scripts/common/Connect-M365Graph.ps1"
+          if (Test-Path $connectScript) {
+            . $connectScript
+            try { Disconnect-M365Connections } catch { Write-Host "##[warning]Cleanup disconnect: $_" }
+          } elseif (Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) {
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+          }
+          if ($env:GITEA_RUN_ID) {
+            Remove-Item -Path "/tmp/act-jobs/$($env:GITEA_RUN_ID)" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed job session: /tmp/act-jobs/$($env:GITEA_RUN_ID)"
+          }

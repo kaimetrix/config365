@@ -1,0 +1,12 @@
+# GHCR pull overlay — use with docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d --force-recreate
+#
+# Set CONFIG365_IMAGE_TAG in .env (e.g. 1.2.10 or latest).
+# Images at ghcr.io/potsolutions/* are public — no docker login required.
+
+services:
+  config365:
+    image: ghcr.io/potsolutions/config365-preview:${CONFIG365_IMAGE_TAG:-latest}
+    build: !reset null
+    pull_policy: always

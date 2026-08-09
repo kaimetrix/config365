@@ -1,0 +1,17 @@
+# Config365 act_runner — Docker job mode (local dev with docker.sock mounted)
+# Spawns config365-runner:latest containers per job. Not used on Azure App Service.
+
+log:
+  level: info
+
+runner:
+  capacity: 4
+  timeout: 3h
+
+cache:
+  enabled: false
+
+container:
+  # Set by docker-compose.runner-docker.yml overlay (compose project network name)
+  network: "config365_default"
+  options: "--add-host=host.docker.internal:host-gateway"

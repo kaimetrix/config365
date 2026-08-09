@@ -1,0 +1,16 @@
+# Config365 act_runner — Sharded Host Mode (one daemon per shard, capacity 1)
+# Copied per shard to /data/runner-shards/{N}/config.yml with SHARD_ID substituted.
+# Parallel tenant jobs: run N independent act_runner daemons (see setup-runner-shards.sh).
+
+log:
+  level: info
+
+runner:
+  capacity: 1
+  timeout: 3h
+
+host:
+  workdir_parent: /data/runner-shards/SHARD_ID/work
+
+cache:
+  enabled: false

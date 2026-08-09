@@ -1,0 +1,61 @@
+# Config365 — MSP Engine workflow sync
+#
+# Keeps engine workflow files up-to-date by pulling the latest versions from
+# config365/orchestrator/engine-workflows/ and committing any changes back to
+# this repo. Run nightly or on demand.
+#
+# This file itself is seeded once by the Config365 portal and is NOT
+# overwritten by the sync (only the other engine workflow files are synced).
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-workflows:
+    name: Sync Engine Workflows
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout engine repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CONFIG365_TOKEN }}
+
+      - name: Clone orchestrator (engine-workflows source)
+        run: |
+          git clone --depth 1 \
+            "http://x-token:${{ secrets.CONFIG365_TOKEN }}@$(echo '${{ gitea.server_url }}' | sed 's|http://||')/config365/orchestrator" \
+            /tmp/orchestrator
+
+      - name: Sync workflow files
+        run: |
+          CHANGED=0
+          ENGINE_DIR="/tmp/orchestrator/engine-workflows"
+          if [ ! -d "$ENGINE_DIR" ]; then
+            echo "No engine-workflows/ directory found in orchestrator — nothing to sync."
+            exit 0
+          fi
+          for f in "$ENGINE_DIR"/*.yml; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            # Never overwrite the sync workflow itself
+            [ "$fname" = "sync-workflows.yml" ] && continue
+            dest=".gitea/workflows/$fname"
+            if [ ! -f "$dest" ] || ! cmp -s "$f" "$dest"; then
+              cp "$f" "$dest"
+              CHANGED=1
+              echo "Updated: $dest"
+            fi
+          done
+          if [ "$CHANGED" = "1" ]; then
+            git config user.email "config365-bot@localhost"
+            git config user.name  "Config365 Bot"
+            git add .gitea/workflows/
+            git commit -m "sync: update engine workflows from config365/orchestrator"
+            git push
+            echo "Engine workflows synced."
+          else
+            echo "All engine workflows already up to date."
+          fi

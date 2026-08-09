@@ -1,0 +1,104 @@
+# Config365 — Maintenance pipeline template (Gitea Actions)
+# Runs nightly. Performs:
+#   - Group split rebalancing (Entra group membership by percentage)
+#   - Exchange default font configuration
+#   - Intune device renaming
+#   - Intune primary user assignment
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 4 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+      what_if:
+        description: 'Preview changes without applying'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  maintenance:
+    name: Nightly Maintenance
+    runs-on: [self-hosted, linux]
+    container:
+      image: config365-runner:latest
+
+    steps:
+      - name: Checkout tenant repo
+        uses: actions/checkout@v4
+        with:
+          path: tenant-repo
+
+      - name: Checkout Config365 scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ gitea.server_url | trimPrefix('https://') }}/${{ vars.CONFIG365_ORG }}/Config365
+          ref: main
+          path: Config365
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Maintenance — Group splits
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Invoke-MaintenanceGroupSplits.ps1 \
+            -TenantRepoPath '${{ gitea.workspace }}/tenant-repo' \
+            -WhatIf:$${{ inputs.what_if }} \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+        continue-on-error: true
+
+      - name: Maintenance — Exchange fonts
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Configure-ExchangeFonts.ps1 \
+            -TenantRepoPath '${{ gitea.workspace }}/tenant-repo' \
+            -WhatIf:$${{ inputs.what_if }} \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+        continue-on-error: true
+
+      - name: Maintenance — Intune device rename
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Invoke-IntuneDeviceRename.ps1 \
+            -TenantRepoPath '${{ gitea.workspace }}/tenant-repo' \
+            -WhatIf:$${{ inputs.what_if }} \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+        continue-on-error: true
+
+      - name: Maintenance — Intune primary user assignment
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Invoke-IntuneAssignPrimaryUser.ps1 \
+            -TenantRepoPath '${{ gitea.workspace }}/tenant-repo' \
+            -WhatIf:$${{ inputs.what_if }} \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+        continue-on-error: true
+
+      - name: Maintenance — Entra ID inactive device cleanup
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Invoke-EntraDeviceCleanup.ps1 \
+            -TenantRepoPath '${{ gitea.workspace }}/tenant-repo' \
+            -WhatIf:$${{ inputs.what_if }} \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+        continue-on-error: true

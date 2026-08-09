@@ -1,0 +1,22 @@
+# Optional overlay for local dev — Docker job mode (per-job containers).
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.runner-docker.yml up -d --build
+#
+# Requires Docker socket on the host. Azure App Service cannot use this overlay;
+# production uses sharded host runners (RUNNER_SHARDS, default 4).
+
+services:
+  config365:
+    environment:
+      RUNNER_MODE: docker
+      RUNNER_SHARDS: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  config365-runner:
+    build:
+      context: ./runner
+      dockerfile: Dockerfile
+    image: config365-runner:latest
+    profiles:
+      - runner-docker-build

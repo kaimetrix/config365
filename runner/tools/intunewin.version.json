@@ -1,0 +1,8 @@
+{
+  "name": "intunewin",
+  "version": "0.0.5",
+  "sourceUrl": "https://github.com/kenchan0130/intunewin/releases/download/v0.0.5/intunewin_0.0.5_Linux_x86_64.tar.gz",
+  "checksumSha256": "d4430b13988de39c347ccc9df2f850d8947e47816822becb29bb67156c682d57",
+  "installPath": "/usr/local/share/config365/tools/intunewin",
+  "archiveInnerBinary": "intunewin"
+}

@@ -1,0 +1,33 @@
+# ─── Secrets ─────────────────────────────────────────────────────────────────
+.env
+*.pem
+*.key
+*.pfx
+
+# ─── Node / portal ───────────────────────────────────────────────────────────
+portal/node_modules/
+portal/dist/
+portal/.astro/
+portal.legacy/node_modules/
+portal.legacy/dist/
+portal.legacy/.astro/
+portal-next/node_modules/
+portal-next/.next/
+
+# ─── Docker build artifacts ───────────────────────────────────────────────────
+*.tar
+
+# ─── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+.cache/
+
+# ─── Debug helpers / one-shot investigation artifacts ────────────────────────
+# Underscore-prefixed files in runner/scripts/ are NEVER production code —
+# they are local helpers (_inspect-*.py, _phase*-run-*.log, _gitea-*.mjs)
+# kept out of the orchestrator sync. Production scripts use kebab-case/PascalCase.
+runner/scripts/_*
+runner/scripts/**/_*
+
+# Legacy: underscore helpers under runner/scripts (prefer .debug/scripts/ for new tooling)

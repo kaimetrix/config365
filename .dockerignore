@@ -1,0 +1,20 @@
+# Underscore-prefixed files in runner/scripts/ are local debug helpers / ad-hoc
+# artifacts (_inspect-*.py, _phase*-run-*.log, _gitea-debug-*.mjs, etc.).
+# They must never be baked into /scripts-staging/ or pushed to config365/orchestrator
+# by the bootstrapper. Production scripts use kebab-case or PascalCase only.
+runner/scripts/_*
+runner/scripts/**/_*
+
+# Standard noise
+.env
+*.pem
+*.key
+*.pfx
+*.tar
+.DS_Store
+Thumbs.db
+.git
+.gitignore
+node_modules
+portal-next/.next
+portal-next/node_modules

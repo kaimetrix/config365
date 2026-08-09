@@ -1,0 +1,287 @@
+# Config365 - Tenant backup workflow
+# Each backup category runs as a separate named step for visibility in the Gitea Actions UI.
+# Scripts are called directly (like the deploy pipeline calls Configure-*.ps1).
+# To add/change backup categories, update the individual Backup-*.ps1 scripts in
+# config365/orchestrator/backup/ — never touch this file unless adding a new category.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  backup:
+    name: Export M365 Configurations
+    runs-on: self-hosted
+    steps:
+      - name: Checkout tenant repository
+        run: git clone ${{ gitea.server_url }}/${{ gitea.repository }} tenant
+
+      - name: Checkout orchestrator scripts
+        run: git clone ${{ gitea.server_url }}/config365/orchestrator scripts
+
+      - name: Prepare - Assign Required Directory Roles
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Prepare-TenantRoles.ps1" `
+            -Verbose:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          PORTAL_TOKEN_API_URL: ${{ vars.PORTAL_TOKEN_API_URL }}
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+
+      - name: Initialize backup
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-Initialize.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Groups
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-Groups.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Licenses
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-Licenses.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Conditional Access
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-ConditionalAccess.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Custom Security Attributes
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-CustomAttributes.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Authentication Policies
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-AuthenticationPolicies.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - SharePoint Settings
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-SharePointSettings.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - SharePoint Tenant Settings (SpoTenant)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-SharePointTenantSettings.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Backup - Consent Permissions
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-ConsentPermissions.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Enterprise Apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-EnterpriseApps.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Intune
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-Intune.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Choco Apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-ChocoApps.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - WinGet Apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-WingetApps.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Custom Apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-CustomApps.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Defender Devices
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-DefenderDevices.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup - Exchange Online
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-Exchange.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Backup - Exchange Message Encryption (IRM/OME)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Backup-ExchangeMessageEncryption.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode == 'true' }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Commit and push backup
+        if: always()
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+          GIT_HTTP_LOW_SPEED_TIME: "20"
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/tenant"
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+          git add -A "backups/"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+            pfx="${{ gitea.event_name == 'schedule' && 'Scheduled backup' || 'Manual backup' }}"
+            git commit -m "${pfx}: ${ts}"$'\n\n'"Run ID: ${{ gitea.run_id }}"
+            pushed=false
+            for i in 1 2 3; do
+              git fetch origin "$GITHUB_REF_NAME"
+              if git rebase "origin/$GITHUB_REF_NAME"; then
+                if git push origin "HEAD:$GITHUB_REF_NAME"; then
+                  pushed=true
+                  break
+                fi
+              else
+                git rebase --abort
+                break
+              fi
+              echo "Push attempt $i failed, retrying..."
+              sleep 2
+            done
+            if [ "$pushed" = true ]; then
+              echo "Backup committed and pushed"
+            else
+              echo "WARNING: Could not push backup after 3 attempts - skipping (non-blocking)"
+            fi
+          fi

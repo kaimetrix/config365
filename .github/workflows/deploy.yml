@@ -1,0 +1,117 @@
+# Partner deploy workflow — copied to .github/workflows/deploy.yml on release snapshot.
+#
+# Target: Azure Linux App Service (custom container from public GHCR).
+# Versioning: VERSION is EPOCH.PLATFORM.APP (e.g. 1.2.10).
+# App releases (3rd digit): no App Service change — apply via Platform Admin.
+# Platform releases (2nd digit): point the web app at the new GHCR image tag and restart.
+#
+# ── Required GitHub Secrets (partner fork) ───────────────────────────────────
+#   AZURE_CLIENT_ID        — App registration with federated credential for this repo
+#   AZURE_TENANT_ID
+#   AZURE_SUBSCRIPTION_ID
+#
+# ── Required GitHub Variables (partner fork) ─────────────────────────────────
+#   APP_NAME               — Linux Web App name (e.g. contoso-config365-prod)
+#   RESOURCE_GROUP         — Azure resource group containing the web app
+#
+# ── Optional GitHub Variables ────────────────────────────────────────────────
+#   GHCR_IMAGE             — default ghcr.io/potsolutions/config365-preview
+#                            — use ghcr.io/potsolutions/config365 for GA channel
+#   RELEASE_REPO           — default potsolutions/config365-preview (manifest check)
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'GHCR image tag for platform updates — default latest'
+        required: false
+        default: 'latest'
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy → Azure App Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect if platform (Docker) update is required
+        id: meta
+        env:
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+        run: |
+          REPO="${RELEASE_REPO:-potsolutions/config365-preview}"
+          VERSION=$(cat VERSION)
+          echo "app_version=${VERSION}" >> "$GITHUB_OUTPUT"
+          NEEDS_IMAGE=false
+          if gh release view "v${VERSION}" --repo "${REPO}" \
+              --json assets -q '.assets[].name' 2>/dev/null | grep -q '^platform-manifest.json$'; then
+            NEEDS_IMAGE=true
+          fi
+          echo "needs_image=${NEEDS_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Platform image update required: ${NEEDS_IMAGE}"
+
+      - name: Azure login (OIDC)
+        if: steps.meta.outputs.needs_image == 'true'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Platform update → Azure App Service
+        if: steps.meta.outputs.needs_image == 'true'
+        env:
+          IMAGE_TAG: ${{ inputs.version || 'latest' }}
+          GHCR_IMAGE: ${{ vars.GHCR_IMAGE }}
+        run: |
+          set -euo pipefail
+          IMAGE="${GHCR_IMAGE:-ghcr.io/potsolutions/config365-preview}"
+          FULL_IMAGE="${IMAGE}:${IMAGE_TAG}"
+          echo "Deploying ${FULL_IMAGE} to App Service ${{ vars.APP_NAME }}"
+
+          az webapp config container set \
+            --name           "${{ vars.APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --docker-custom-image-name "${FULL_IMAGE}"
+
+          az webapp config appsettings set \
+            --name           "${{ vars.APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --settings WEBSITES_ENABLE_APP_SERVICE_STORAGE=true \
+            --output none
+
+          az webapp restart \
+            --name           "${{ vars.APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}"
+
+          echo "Waiting 90s for container startup..."
+          sleep 90
+          STATE=$(az webapp show \
+            --name           "${{ vars.APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query state -o tsv)
+          echo "App Service state: ${STATE}"
+          [ "${STATE}" = "Running" ] || { echo "App Service not running after deploy"; exit 1; }
+
+          HOST=$(az webapp show \
+            --name           "${{ vars.APP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query defaultHostName -o tsv)
+          echo "Deployed ${FULL_IMAGE} → https://${HOST}"
+
+      - name: App update hint (no Docker rebuild)
+        if: steps.meta.outputs.needs_image != 'true'
+        run: |
+          echo "No Azure container update required for v$(cat VERSION)."
+          echo "Apply the app update from Platform Admin → Software update."
+          echo "App-layer updates use the persistent /home volume — no App Service recreate needed."

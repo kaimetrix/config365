@@ -1,0 +1,160 @@
+# Config365 — Tenant backup workflow
+# Runs the M365 backup pipeline directly on the self-hosted runner.
+# Pipeline scripts live in config365/orchestrator and are cloned each run.
+# Uses system git (which respects .gitconfig URL rewrite) for cross-repo clones.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  backup:
+    name: Export M365 Configurations
+    runs-on: self-hosted
+    steps:
+      - name: Checkout tenant repository
+        run: git clone ${{ gitea.server_url }}/${{ gitea.repository }} tenant
+
+      - name: Checkout orchestrator scripts
+        run: git clone ${{ gitea.server_url }}/config365/orchestrator scripts
+
+      - name: Initialize backup directory
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          if (Test-Path $bp) {
+            Get-ChildItem $bp | Where-Object { $_.Name -ne 'logs' } | Remove-Item -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $bp -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $bp 'logs') -Force | Out-Null
+          Write-Host 'Backup directory ready'
+
+      - name: Backup — Groups
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          $sd = "${{ gitea.workspace }}/scripts/backup"
+          . "$sd/Backup-Common.ps1"; $script:BackupPath = $bp
+          Initialize-BackupLogging -BackupPath $bp
+          if (-not (Connect-M365Backup)) { throw 'Failed to connect to Microsoft Graph' }
+          . "$sd/Backup-Groups.ps1" -BackupPath $bp
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          Tenant_CLIENT_ID: ${{ secrets.TENANT_CLIENT_ID }}
+          Tenant_CLIENT_SECRET: ${{ secrets.TENANT_CLIENT_SECRET }}
+
+      - name: Backup — Conditional Access
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          $sd = "${{ gitea.workspace }}/scripts/backup"
+          . "$sd/Backup-Common.ps1"; $script:BackupPath = $bp
+          Initialize-BackupLogging -BackupPath $bp
+          if (-not (Connect-M365Backup)) { throw 'Failed to connect to Microsoft Graph' }
+          . "$sd/Backup-ConditionalAccess.ps1" -BackupPath $bp
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup — Intune
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          $sd = "${{ gitea.workspace }}/scripts/backup"
+          . "$sd/Backup-Common.ps1"; $script:BackupPath = $bp
+          Initialize-BackupLogging -BackupPath $bp
+          if (-not (Connect-M365Backup)) { throw 'Failed to connect to Microsoft Graph' }
+          . "$sd/Backup-Intune.ps1" -BackupPath $bp
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Backup — Exchange Online
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          $sd = "${{ gitea.workspace }}/scripts/backup"
+          . "$sd/Backup-Common.ps1"; $script:BackupPath = $bp
+          Initialize-BackupLogging -BackupPath $bp
+          if (-not (Connect-M365Backup)) { throw 'Failed to connect to Microsoft Graph' }
+          . "$sd/Backup-Exchange.ps1" -BackupPath $bp
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Backup — Exchange Message Encryption (IRM/OME)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          $sd = "${{ gitea.workspace }}/scripts/backup"
+          . "$sd/Backup-Common.ps1"; $script:BackupPath = $bp
+          Initialize-BackupLogging -BackupPath $bp
+          . "$sd/Backup-ExchangeMessageEncryption.ps1" -BackupPath $bp
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Backup — Enterprise Applications
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $bp = "${{ gitea.workspace }}/tenant/backups"
+          $sd = "${{ gitea.workspace }}/scripts/backup"
+          . "$sd/Backup-Common.ps1"; $script:BackupPath = $bp
+          Initialize-BackupLogging -BackupPath $bp
+          if (-not (Connect-M365Backup)) { throw 'Failed to connect to Microsoft Graph' }
+          . "$sd/Backup-EnterpriseApps.ps1" -BackupPath $bp
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Resolve ID placeholders
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Resolve-BackupPlaceholders.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups"
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+
+      - name: Commit and push backup
+        shell: pwsh
+        run: |
+          Set-Location "${{ gitea.workspace }}/tenant"
+          git config user.email 'config365-bot@config365.local'
+          git config user.name  'Config365 Bot'
+          git add -A 'backups/'
+          $s = git status --porcelain
+          if ($s) {
+            $ts  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $pfx = if ('${{ gitea.event_name }}' -eq 'schedule') { 'Scheduled backup' } else { 'Manual backup' }
+            git commit -m "${pfx}: ${ts}`n`nRun ID: ${{ gitea.run_id }}`nTenant: ${{ vars.TENANT_NAME }}"
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            Write-Host 'Backup committed and pushed'
+          } else {
+            Write-Host 'No changes to commit'
+          }

@@ -1,0 +1,6 @@
+{
+  "name": "IntuneWinAppUtil.exe",
+  "sourceUrl": "https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe",
+  "installPath": "/usr/local/share/config365/tools/IntuneWinAppUtil.exe",
+  "repoPath": "runner/tools/IntuneWinAppUtil.exe"
+}

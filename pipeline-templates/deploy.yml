@@ -1,0 +1,144 @@
+# Config365 — Deploy pipeline template (Gitea Actions)
+# Called from tenant repos via .gitea/workflows/deploy.yml
+#
+# Secrets required (set at org level or repo level):
+#   CLIENT_ID       — M365 app registration client ID
+#   CLIENT_SECRET   — M365 app registration client secret
+#   MSP_TENANT_ID   — Tenant ID of the MSP (where the app registration lives)
+#   TENANT_ID       — Tenant ID of the managed tenant
+#   EXCHANGE_ORG    — Exchange Online org name (e.g. contoso), optional
+#
+# Runner label: self-hosted (the act_runner in the AIO container)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: false
+        default: 'production'
+        type: choice
+        options: [production, staging, development]
+      debug_mode:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  # ─── Plan stage ─────────────────────────────────────────────────────────────
+  plan:
+    name: Generate Deployment Plan (WhatIf)
+    runs-on: [self-hosted, linux]
+    container:
+      image: config365-runner:latest
+      # Pin to digest in production: config365-runner@sha256:<digest>
+
+    steps:
+      - name: Checkout tenant repo
+        uses: actions/checkout@v4
+        with:
+          path: tenant-repo
+
+      - name: Checkout Config365 scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ gitea.server_url | trimPrefix('https://') }}/${{ vars.CONFIG365_ORG }}/Config365
+          ref: main
+          path: Config365
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ gitea.server_url | trimPrefix('https://') }}/${{ vars.CONFIG365_ORG }}/baseline
+          ref: main
+          path: baseline
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Sync pipeline from tenant-template
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/Sync-TenantPipeline.ps1 \
+            -TenantRepoPath "${{ gitea.workspace }}/tenant-repo" \
+            -TemplatePath "${{ gitea.workspace }}/tenant-template"
+        continue-on-error: true
+
+      - name: Generate deployment plan (WhatIf)
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Configure-Intune.ps1 \
+            -WhatIf \
+            -Environment "${{ inputs.environment }}" \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          MSP_TENANT_ID: ${{ secrets.MSP_TENANT_ID }}
+          TENANT_REPO_PATH: ${{ gitea.workspace }}/tenant-repo
+          BASELINE_PATH: ${{ gitea.workspace }}/baseline
+          CONFIG365_PATH: /config365
+
+      - name: Upload deployment plan artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-plan-${{ inputs.environment }}
+          path: /tmp/deployment-plan/
+          retention-days: 7
+
+  # ─── Deploy stage (requires environment approval) ────────────────────────────
+  deploy:
+    name: Apply Configuration
+    needs: plan
+    runs-on: [self-hosted, linux]
+    environment:
+      name: ${{ inputs.environment }}
+      # Configure reviewers in Gitea: Repo → Settings → Environments → production
+      # This gates execution here — pipeline pauses until approved.
+
+    container:
+      image: config365-runner:latest
+
+    steps:
+      - name: Checkout tenant repo
+        uses: actions/checkout@v4
+        with:
+          path: tenant-repo
+
+      - name: Checkout Config365 scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ gitea.server_url | trimPrefix('https://') }}/${{ vars.CONFIG365_ORG }}/Config365
+          ref: main
+          path: Config365
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ gitea.server_url | trimPrefix('https://') }}/${{ vars.CONFIG365_ORG }}/baseline
+          ref: main
+          path: baseline
+          token: ${{ secrets.GITEA_TOKEN }}
+
+      - name: Apply all configurations
+        run: |
+          pwsh -NonInteractive -File /config365/scripts/graph-configs/Configure-Intune.ps1 \
+            -Environment "${{ inputs.environment }}" \
+            -Verbose:$${{ inputs.debug_mode }}
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.TENANT_ID }}
+          MSP_TENANT_ID: ${{ secrets.MSP_TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+          TENANT_REPO_PATH: ${{ gitea.workspace }}/tenant-repo
+          BASELINE_PATH: ${{ gitea.workspace }}/baseline
+          CONFIG365_PATH: /config365
+
+      - name: Upload deployment results artifact
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: deployment-results-${{ inputs.environment }}
+          path: /tmp/deployment-results/
+          retention-days: 30

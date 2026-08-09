@@ -1,0 +1,734 @@
+# Config365 â€” Tenant Backup Pipeline
+#
+# This file is the canonical template stored in config365/orchestrator.
+# Tenant repos contain an identical copy at .gitea/workflows/backup.yml.
+# The "Sync pipeline" step keeps them in sync automatically â€” changes here
+# apply to all tenants on their next run.
+#
+# Required org-level secrets (MSP Gitea org -- available via secrets: inherit):
+#   PORTAL_INTERNAL_KEY  - Shared secret for the internal token API (Gitea masks it)
+#
+# Required repo-level vars (set per tenant):
+#   TENANT_SLUG          - Tenant identifier matching the Config365 database slug
+#
+# Optional repo-level secrets (Exchange Online):
+#   EXCHANGE_ORG         - Exchange Online org name (e.g. contoso)
+#
+# NOTE: CLIENT_ID, CLIENT_SECRET, TENANT_ID are no longer used.
+# Connect-M365Graph.ps1 fetches delegated tokens from the token API (PORTAL_TOKEN_API_URL, defaults to http://localhost:4322).
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: backup-${{ gitea.repository }}
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    name: Export M365 Configurations
+    runs-on: self-hosted
+    env:
+      GITEA_RUN_ID: ${{ gitea.run_id }}
+      HOME: /tmp/act-jobs/${{ gitea.run_id }}
+      USERPROFILE: /tmp/act-jobs/${{ gitea.run_id }}
+      XDG_CACHE_HOME: /tmp/act-jobs/${{ gitea.run_id }}/.cache
+      PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+      TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+    steps:
+      - name: Initialize Job Session Isolation
+        shell: bash
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME"
+          export USERPROFILE="$HOME"
+          mkdir -p "$USERPROFILE/.azure" "$USERPROFILE/.local/share"
+          for f in .gitconfig .git-credentials .netrc; do
+            [ -f "/root/$f" ] && cp "/root/$f" "$HOME/$f"
+          done
+          # Git 2.35+ rejects checkouts when workspace bind-mount path
+          # (/data/...) differs from the host path Git resolves
+          # (/home/config365-data/...). Mark all dirs safe for this job.
+          git config --global --add safe.directory '*'
+          echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      # â”€â”€ Checkout tenant repo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Checkout Tenant Repository
+        run: git clone ${{ gitea.server_url }}/${{ gitea.repository }} tenant
+
+      # â”€â”€ Checkout orchestrator (scripts + pipeline template) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Checkout Orchestrator
+        run: git clone ${{ gitea.server_url }}/${{ vars.PLATFORM_ORG }}/orchestrator scripts
+
+      # â”€â”€ Sync pipeline from orchestrator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # Compares the orchestrator's backup-pipeline.yml with this tenant's
+      # backup.yml. If they differ, updates backup.yml and commits so the
+      # next run automatically picks up any pipeline changes.
+      - name: Sync pipeline from orchestrator
+        run: |
+          orch_file="${{ gitea.workspace }}/scripts/.gitea/workflows/backup-pipeline.yml"
+          tenant_file="${{ gitea.workspace }}/tenant/.gitea/workflows/backup.yml"
+          if ! cmp -s "$orch_file" "$tenant_file"; then
+            echo "Pipeline differs from orchestrator - syncing..."
+            cp "$orch_file" "$tenant_file"
+            cd "${{ gitea.workspace }}/tenant"
+            git config --global --add safe.directory '*'
+            git config user.email "config365-bot@config365.local"
+            git config user.name  "Config365 Bot"
+            git add .gitea/workflows/backup.yml
+            git commit -m "sync: update pipeline from config365/orchestrator"
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            echo "Pipeline synced. New steps will apply on next run."
+          else
+            echo "Pipeline is up to date."
+          fi
+
+      # -- Assign required directory roles ──────────────────────────────────────────────────
+      - name: Prepare - Assign Required Directory Roles
+        id: step_prepare_roles
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/graph-configs/Prepare-TenantRoles.ps1" `
+            -Verbose:$${{ inputs.debug_mode || false }}
+
+      - name: Initialize Backup Directory
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          if (Test-Path $backupPath) {
+            # Retained across runs (date-keyed / cumulative data):
+            #   logs            — pipeline logs
+            #   signin-logs     — daily sign-in log files (90-day retention in script)
+            #   secure-score    — history/ daily score files (Write-HistoryFileIfMissing skips existing dates)
+            Get-ChildItem -Path $backupPath |
+              Where-Object { $_.Name -notin @('logs', 'signin-logs', 'secure-score') } |
+              Remove-Item -Recurse -Force
+            Write-Host "Cleared previous backup files from: $backupPath"
+          }
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $backupPath 'logs') -Force | Out-Null
+          Write-Host "Backup directory ready"
+
+      # â”€â”€ 1. Backup: Groups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Groups
+        id: step_backup_groups
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-Groups.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 1b. Backup: Licenses â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+      # ── 1b. Backup: Group Membership ─────────────────────────────────────────
+      - name: Backup - Group Membership
+        id: step_backup_group_membership
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-GroupMembership.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+      - name: Backup - Licenses
+        id: step_backup_licenses
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-Licenses.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 2. Backup: Conditional Access â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Conditional Access
+        id: step_backup_ca
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-ConditionalAccess.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 3. Backup: Custom Security Attributes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Custom Security Attributes
+        id: step_backup_custom_attrs
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-CustomAttributes.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 4. Backup: Authentication Policies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Authentication Policies
+        id: step_backup_auth_policies
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-AuthenticationPolicies.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Backup - Entra ID Device Settings
+        id: step_backup_entra_id_settings
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-EntraIDSettings.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Backup - Defender Connector
+        id: step_backup_defender_connector
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-DefenderConnector.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 5. Backup: SharePoint Settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - SharePoint Settings
+        id: step_backup_sharepoint
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-SharePointSettings.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Backup - SharePoint Tenant Settings (SpoTenant)
+        id: step_backup_sharepoint_tenant
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          . "$scriptDir/Backup-SharePointTenantSettings.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # â”€â”€ 6. Backup: Consent Permissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Consent Permissions
+        id: step_backup_consent
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-ConsentPermissions.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 7. Backup: Intune â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Intune
+        id: step_backup_intune
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-Intune.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 7b. Backup: Chocolatey Apps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Chocolatey Apps
+        id: step_backup_choco
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-ChocoApps.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 7c. Backup: WinGet Apps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - WinGet Apps
+        id: step_backup_winget
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-WingetApps.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 7d. Backup: Custom Apps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Custom Apps
+        id: step_backup_custom_apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-CustomApps.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 7d2. Backup: Printer Apps ─────────────────────────────────────────────
+      - name: Backup - Printer Apps
+        id: step_backup_printer_apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-PrinterApps.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 7e. Backup: Defender for Endpoint Devices â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Defender for Endpoint Devices
+        id: step_backup_defender
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          . "$scriptDir/Backup-DefenderDevices.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 7f. Backup: Intune Device Compliance Data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Intune Device Compliance Data
+        id: step_backup_intune_devices
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-IntuneDevices.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 8. Backup: Exchange Online â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Exchange Online
+        id: step_backup_exchange
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-Exchange.ps1" -BackupPath $backupPath
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      - name: Backup - Exchange Message Encryption (IRM/OME)
+        id: step_backup_exchange_message_encryption
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          . "$scriptDir/Backup-ExchangeMessageEncryption.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # â”€â”€ 9. Backup: Enterprise Applications â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup - Enterprise Applications
+        id: step_backup_enterprise_apps
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-EnterpriseApps.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # â”€â”€ 10. Resolve: Translate IDs to Placeholders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # ── 10. Backup: Entra Sign-In Logs ──────────────────────────────────────────
+      # Requires Entra ID P1 or P2. Exits cleanly with a warning on 403.
+      # UTC daily files; re-refreshes days overlapping the last 7d time window (includes today).
+      - name: Backup - Sign-In Logs
+        id: step_backup_signin
+        continue-on-error: true
+        timeout-minutes: 90
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-SignInLogs.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      # ── 11. Backup: Secure Score ─────────────────────────────────────────────────
+      # Requires SecurityEvents.Read.All. Exits cleanly with a warning on 403.
+      - name: Backup - Secure Score
+        id: step_backup_secure_score
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $backupPath = "${{ gitea.workspace }}/tenant/backups"
+          $scriptDir  = "${{ gitea.workspace }}/scripts/backup"
+          . "$scriptDir/Backup-Common.ps1"
+          $script:BackupPath = $backupPath
+          Initialize-BackupLogging -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+          $connected = Connect-M365Backup
+          if (-not $connected) { throw "Failed to connect to Microsoft Graph" }
+          . "$scriptDir/Backup-SecureScore.ps1" -BackupPath $backupPath -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+
+      - name: Resolve - Translate IDs to Placeholders
+        id: step_resolve_ids
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "${{ gitea.workspace }}/scripts/backup/Resolve-BackupPlaceholders.ps1" `
+            -BackupPath "${{ gitea.workspace }}/tenant/backups" `
+            -DebugMode:$${{ inputs.debug_mode || false }}
+        env:
+          PORTAL_INTERNAL_KEY: ${{ secrets.PORTAL_INTERNAL_KEY }}
+          TENANT_SLUG: ${{ vars.TENANT_SLUG }}
+          EXCHANGE_ORG_NAME: ${{ secrets.EXCHANGE_ORG }}
+
+      # ── Validate backup steps ───────────────────────────────────────────────────
+      # Must run before manifest/commit. The init step wipes backups/ at the start;
+      # committing after a partial run would push missing files as deletions in git.
+      - name: Validate Backup Steps
+        id: validate_backup
+        if: always()
+        shell: bash
+        run: |
+          FAILED=0
+          [[ "${{ steps.step_prepare_roles.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_groups.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_group_membership.outcome }}" == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_licenses.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_ca.outcome }}"               == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_custom_attrs.outcome }}"     == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_auth_policies.outcome }}"    == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_sharepoint.outcome }}"       == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_consent.outcome }}"          == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_intune.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_choco.outcome }}"            == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_winget.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_custom_apps.outcome }}"      == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_defender.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_exchange.outcome }}"         == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_enterprise_apps.outcome }}"  == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_signin.outcome }}"           == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_backup_secure_score.outcome }}"     == "failure" ]] && FAILED=1
+          [[ "${{ steps.step_resolve_ids.outcome }}"             == "failure" ]] && FAILED=1
+          if [ $FAILED -eq 1 ]; then
+            echo "One or more backup steps failed."
+            echo "Skipping manifest generation and git commit to avoid partial backup data."
+            exit 1
+          fi
+          echo "All backup steps completed successfully."
+
+      - name: Backup Commit Skipped
+        if: always() && steps.validate_backup.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host "==========================================" -ForegroundColor Yellow
+          Write-Host "  BACKUP COMMIT SKIPPED" -ForegroundColor Yellow
+          Write-Host "==========================================" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "One or more backup steps failed. Partial export data was discarded."
+          Write-Host "The tenant git repo was NOT updated — previous backup remains intact."
+          Write-Host "Fix the failing step(s) and re-run the backup pipeline."
+
+      # â”€â”€ Generate Backup Manifest â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Generate Backup Manifest
+        if: steps.validate_backup.outcome == 'success'
+        shell: pwsh
+        run: |
+          $backupPath   = "${{ gitea.workspace }}/tenant/backups"
+          $manifestPath = Join-Path $backupPath "backup-manifest.json"
+
+          $components = @{}
+          $subdirs = @(
+            @{ Name = "Groups";                 Dir = "groups" },
+            @{ Name = "Licenses";               Dir = "licenses" },
+            @{ Name = "ConditionalAccess";      Dir = "conditional-access" },
+            @{ Name = "CustomAttributes";       Dir = "custom-attributes" },
+            @{ Name = "AuthenticationPolicies"; Dir = "authentication-policies" },
+            @{ Name = "EntraIDSettings";        Dir = "entra-id-device-settings" },
+            @{ Name = "DefenderConnector";      Dir = "intune/defender-connector" },
+            @{ Name = "SharePointSettings";     Dir = "sharepoint-settings" },
+            @{ Name = "ConsentPermissions";     Dir = "consent-permissions" },
+            @{ Name = "Intune";                 Dir = "intune" },
+            @{ Name = "ChocoApps";              Dir = "intune/apps/chocolatey" },
+            @{ Name = "WingetApps";             Dir = "intune/apps/winget" },
+            @{ Name = "CustomApps";             Dir = "intune/apps/custom" },
+            @{ Name = "PrinterApps";            Dir = "intune/apps/printer" },
+            @{ Name = "Exchange";               Dir = "exchange" },
+            @{ Name = "EnterpriseApps";         Dir = "enterprise-apps" },
+            @{ Name = "DefenderDevices";        Dir = "defender-devices" },
+            @{ Name = "SignInLogs";             Dir = "signin-logs" },
+            @{ Name = "SecureScore";            Dir = "secure-score" }
+          )
+
+          foreach ($entry in $subdirs) {
+            $dirPath = Join-Path $backupPath $entry.Dir
+            if (Test-Path $dirPath) {
+              $count = (Get-ChildItem -Path $dirPath -Recurse -File -ErrorAction SilentlyContinue).Count
+              $components[$entry.Name] = @{ BackedUp = $count; Failed = 0 }
+            }
+          }
+
+          $manifest = @{
+            BackupType         = "M365Configuration"
+            BackupTimestamp    = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+            CompletedTimestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+            DurationSeconds    = 0
+            DebugMode          = [bool]$${{ inputs.debug_mode || false }}
+            RunId              = "${{ gitea.run_id }}"
+            TriggerEvent       = "${{ gitea.event_name }}"
+            BackupSource       = "GiteaActions"
+            Components         = $components
+          }
+
+          $manifest | ConvertTo-Json -Depth 10 | Out-File -FilePath $manifestPath -Encoding UTF8
+          Write-Host "Backup manifest generated"
+          Write-Host (Get-Content $manifestPath | Out-String)
+
+      # â”€â”€ Commit and Push Backup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Commit and Push Backup
+        if: steps.validate_backup.outcome == 'success'
+        shell: pwsh
+        run: |
+          Set-Location "${{ gitea.workspace }}/tenant"
+
+          git config --global --add safe.directory '*'
+          git config user.email "config365-bot@config365.local"
+          git config user.name  "Config365 Bot"
+
+          git fetch origin ${{ gitea.ref_name }}
+
+          git add -A "backups/"
+
+          if (Test-Path "${{ gitea.workspace }}/scripts/backup/Skip-ReorderOnlyChanges.ps1") {
+            & "${{ gitea.workspace }}/scripts/backup/Skip-ReorderOnlyChanges.ps1" `
+              -BackupPath "backups"
+          }
+
+          $status = git status --porcelain
+          if ($status) {
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $prefix = if ("${{ gitea.event_name }}" -eq "schedule") { "Scheduled backup" } else { "Manual backup" }
+            $msg  = "${prefix}: ${timestamp}`n`n"
+            $msg += "Run ID: ${{ gitea.run_id }}`n"
+            $msg += "Tenant: ${{ vars.TENANT_NAME }}"
+            git commit -m $msg
+            git restore .
+            git pull --rebase origin ${{ gitea.ref_name }}
+            git push origin HEAD:${{ gitea.ref_name }}
+            Write-Host "Backup committed and pushed successfully"
+          } else {
+            Write-Host "No changes to commit"
+          }
+
+      # â”€â”€ Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Backup Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== M365 Configuration Backup Summary ==="
+          Write-Host "Backup Date : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "Run ID      : ${{ gitea.run_id }}"
+          Write-Host "Tenant      : ${{ vars.TENANT_NAME }}"
+          Write-Host "Event       : ${{ gitea.event_name }}"
+          Write-Host ""
+          Write-Host "Backed up components:"
+          Write-Host "   1  - Groups"
+          Write-Host "  1b  - Licenses (subscribed SKUs)"
+          Write-Host "   2  - Conditional Access Policies"
+          Write-Host "   3  - Custom Security Attributes"
+          Write-Host "   4  - Authentication Policies"
+          Write-Host "  4b  - Entra ID Device Settings"
+          Write-Host "  4c  - Defender Connector"
+          Write-Host "   5  - SharePoint Settings"
+          Write-Host "   6  - Consent Permissions"
+          Write-Host "   7  - Intune Policies"
+          Write-Host "  7b  - Chocolatey Apps"
+          Write-Host "  7c  - WinGet Apps"
+          Write-Host "  7d  - Custom Apps"
+          Write-Host "  7e  - Defender for Endpoint Devices"
+          Write-Host "  7f  - Intune Device Compliance Data"
+          Write-Host "   8  - Exchange Online"
+          Write-Host "   9  - Enterprise Applications"
+          Write-Host "  10  - Entra Sign-In Logs (P1/P2 required)"
+          Write-Host "=========================================="
+
+      - name: Cleanup Job Session
+        if: always()
+        shell: pwsh
+        run: |
+          $connectScript = "${{ gitea.workspace }}/scripts/common/Connect-M365Graph.ps1"
+          if (Test-Path $connectScript) {
+            . $connectScript
+            try { Disconnect-M365Connections } catch { Write-Host "##[warning]Cleanup disconnect: $_" }
+          } elseif (Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) {
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+          }
+          if ($env:GITEA_RUN_ID) {
+            Remove-Item -Path "/tmp/act-jobs/$($env:GITEA_RUN_ID)" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed job session: /tmp/act-jobs/$($env:GITEA_RUN_ID)"
+          }

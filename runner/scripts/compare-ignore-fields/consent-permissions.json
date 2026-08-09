@@ -1,0 +1,7 @@
+{
+  "pathPrefix": "entra-id-consentpermissions/",
+  "fields": [
+    "servicePrincipalId",
+    "servicePrincipalAppId"
+  ]
+}

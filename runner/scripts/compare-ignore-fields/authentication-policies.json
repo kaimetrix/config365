@@ -1,0 +1,9 @@
+{
+  "fields": [
+    "partialEnablementStrategy",
+    "continuousAccessEvaluation",
+    "defaultPasskeyProfile",
+    "passkeyProfiles",
+    "allowedPasskeyProfiles"
+  ]
+}

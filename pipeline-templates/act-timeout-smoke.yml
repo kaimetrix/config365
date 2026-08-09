@@ -1,0 +1,18 @@
+# Optional manual smoke: verify act_runner enforces per-step timeout-minutes.
+# Dispatch from config365/orchestrator only (not synced to tenant repos).
+# Expected: step fails after ~1 minute with timeout, not after sleep 120 completes.
+on:
+  workflow_dispatch:
+
+jobs:
+  timeout-smoke:
+    name: Act timeout-minutes smoke
+    runs-on: self-hosted
+    steps:
+      - name: Should timeout in 1 minute
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          echo "Sleeping 120s — step should be killed at 60s if timeout-minutes is enforced"
+          sleep 120
+          echo "ERROR: sleep completed — timeout-minutes was NOT enforced"

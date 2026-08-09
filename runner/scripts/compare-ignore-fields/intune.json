@@ -1,0 +1,23 @@
+{
+  "fields": [
+    "settingCount",
+    "supportsScopeTags",
+    "isEncrypted",
+    "secretReferenceValueId",
+    "fileName",
+    "isGlobalScript",
+    "highestAvailableVersion",
+    "deviceHealthScriptType",
+    "priorityMetaData",
+    "templateReference",
+    "settingInstanceTemplateReference",
+    "settingValueTemplateReference",
+    "auditRuleInformation",
+    "templateName",
+    "templateId",
+    "templateDisplayName",
+    "templateDisplayVersion",
+    "targetPrefix",
+    "uploadDateTime"
+  ]
+}

@@ -1,0 +1,48 @@
+# AIO Caddyfile — single-port reverse proxy for Azure App Service / Container Apps
+# Routes /gitea/* to Gitea (port 3000, prefix stripped) and everything else
+# to the Next.js portal (port 4321).
+#
+# Caddy always listens on :80 inside the container (Azure expects port 80).
+# Local Docker publishes that as host port 8080 via PORTAL_HTTP_PORT in .env.
+
+{
+    admin off
+    servers {
+        # Trust proxy headers (X-Forwarded-Proto, X-Forwarded-For) from Azure App
+        # Service's front-end, which terminates HTTPS and forwards HTTP to the
+        # container.  Without this, Caddy overwrites X-Forwarded-Proto with "http"
+        # because it only sees the inner HTTP connection.  private_ranges covers
+        # Azure's internal 10.x / 172.16-31.x infrastructure IPs.
+        trusted_proxies static private_ranges
+    }
+}
+
+:80 {
+    # Redirect bare /gitea (no trailing slash) → /gitea/ so Gitea's router
+    # receives a proper root request.
+    @gitea_bare path /gitea
+    redir @gitea_bare /gitea/ 301
+
+    # Proxy /gitea/* to Gitea — handle_path strips the /gitea prefix so
+    # Gitea receives requests at its own root (e.g. /gitea/foo → /foo).
+    handle_path /gitea/* {
+        reverse_proxy localhost:3000 {
+            header_up Host {http.request.hostport}
+            header_up X-Forwarded-Host {http.request.hostport}
+            # Pass through the original X-Forwarded-Proto from Azure App Service.
+            # Caddy's reverse_proxy would otherwise overwrite it with "http" because
+            # Caddy itself only sees the inner HTTP connection (HTTPS is terminated
+            # by Azure's ARR before reaching the container).
+            header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+        }
+    }
+
+    # All other requests go to the Next.js portal.
+    handle {
+        reverse_proxy localhost:4321 {
+            header_up Host {http.request.hostport}
+            header_up X-Forwarded-Host {http.request.hostport}
+            header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+        }
+    }
+}

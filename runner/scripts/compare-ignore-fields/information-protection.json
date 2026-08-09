@@ -1,0 +1,16 @@
+{
+  "pathPrefix": "information-protection/",
+  "fields": [
+    "Guid", "ImmutableId", "Id", "Identity", "DistinguishedName", "OrganizationId",
+    "WhenChanged", "WhenCreated", "WhenChangedUTC", "WhenCreatedUTC",
+    "CreatedBy", "LastModifiedBy", "ModifiedBy", "ManuallyModified",
+    "ObjectVersion", "PolicyVersion", "RuleVersion",
+    "ObjectState", "ObjectCategory", "ObjectClass",
+    "ExchangeObjectId", "OrganizationalUnitRoot", "OriginatingServer",
+    "IsValid", "DistributionStatus", "DistributionResults", "DistributionSyncStatus",
+    "Workload", "Mode", "Comment", "PolicyTemplateInfo", "PolicyRBACScopes",
+    "ReplicationId", "MasterIdentity", "Priority", "RecommendedPolicyType",
+    "InternalId", "ExternalIdentity", "ExternalDirectoryObjectId",
+    "PolicyName", "PolicyGuid", "Rules"
+  ]
+}
