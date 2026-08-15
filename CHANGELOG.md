@@ -1,3 +1,19 @@
+## [1.2.0] - 2026-08-15
+
+Platform rebuild: new GHCR image with monitor exclude merge fix and prod changes since v1.1.2. Current preview image/setup does not work.
+
+### Changes
+- No commits found since last release
+
+## [1.1.3] - 2026-08-15
+
+### Changes
+- fix(exchange): keep file and folder monitor excludes as separate keys
+- fix(ui): save monitor sidecar on apply and rewrite runner gitconfig
+- fix(exchange): honor file-level monitor exclude when merging folder sidecar
+- Ignore Exchange DirectoryObjectVersion so deploy does not send a read-only backup field to Set-HostedContentFilterPolicy.
+- fix(setup): allow OIDC sign-in during wizard and drop factory reset
+
 ## [1.1.2] - 2026-08-01
 
 ### Changes

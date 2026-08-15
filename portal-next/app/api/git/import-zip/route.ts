@@ -6,6 +6,7 @@ import {
   finalizeImportPaths,
   normalizeZipEntryName,
   shouldSkipZipEntry,
+  isBinaryImportPath,
   ZIP_IMPORT_MAX_BYTES,
 } from '@/lib/zip-import';
 import AdmZip from 'adm-zip';
@@ -25,10 +26,16 @@ function filesFromZipBuffer(buf: Buffer, pathPrefix: string, scope: string | nul
   const entries = zip
     .getEntries()
     .filter((e) => !e.isDirectory && !shouldSkipZipEntry(e.entryName))
-    .map((entry) => ({
-      path: normalizeZipEntryName(entry.entryName),
-      content: entry.getData().toString('utf-8'),
-    }));
+    .map((entry) => {
+      const path = normalizeZipEntryName(entry.entryName);
+      const data = entry.getData();
+      const binary = isBinaryImportPath(path);
+      return {
+        path,
+        content: binary ? data.toString('base64') : data.toString('utf-8'),
+        encoding: binary ? 'base64' as const : 'utf-8' as const,
+      };
+    });
 
   return finalizeImportPaths(entries, { scope, pathPrefix });
 }
@@ -39,7 +46,7 @@ interface JsonImportBody {
   scope?: string | null;
   path?: string | null;
   message?: string | null;
-  files?: Array<{ path?: string; content?: string }>;
+  files?: Array<{ path?: string; content?: string; encoding?: string }>;
 }
 
 function parseJsonImportFiles(
@@ -59,13 +66,16 @@ function parseJsonImportFiles(
     if (!item?.path || typeof item.content !== 'string') {
       return json({ error: 'Each file entry requires path and content' }, 400);
     }
+    const encoding = item.encoding === 'base64' ? 'base64' as const : 'utf-8' as const;
     const rel = normalizeZipEntryName(item.path);
     if (shouldSkipZipEntry(rel)) continue;
-    totalBytes += Buffer.byteLength(item.content, 'utf-8');
+    totalBytes += encoding === 'base64'
+      ? Buffer.from(item.content, 'base64').length
+      : Buffer.byteLength(item.content, 'utf-8');
     if (totalBytes > ZIP_IMPORT_MAX_BYTES) {
       return json({ error: `Import payload exceeds ${Math.round(ZIP_IMPORT_MAX_BYTES / (1024 * 1024))} MB` }, 413);
     }
-    entries.push({ path: rel, content: item.content });
+    entries.push({ path: rel, content: item.content, encoding });
   }
 
   if (entries.length === 0) return json({ error: 'No importable files in payload' }, 400);
@@ -76,7 +86,9 @@ function tooLargeForFastPath(files: BatchFileEntry[]): boolean {
   if (files.length > FAST_PATH_MAX_FILES) return true;
   let bytes = 0;
   for (const f of files) {
-    bytes += Buffer.byteLength(f.content, 'utf-8');
+    bytes += f.encoding === 'base64'
+      ? Buffer.from(f.content, 'base64').length
+      : Buffer.byteLength(f.content, 'utf-8');
     if (bytes > FAST_PATH_MAX_BYTES) return true;
   }
   return false;

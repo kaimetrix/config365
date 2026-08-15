@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
 import { getSetting, setSetting, setEncryptedSetting, isSetupComplete } from '@/lib/server/tenant-store';
+import { getSession } from '@/lib/server/session';
 import { derivePublicOrigin } from '@/lib/server/auth';
 import { bootstrapPlatformIfNeeded, syncScriptsToGitea } from '@/lib/server/platform-bootstrap';
+import { assertSetupPostAllowed } from '@/lib/setup-post-guard';
 
 export const runtime = 'nodejs';
 
@@ -19,6 +21,20 @@ export async function POST(request: Request) {
   catch { return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }); }
 
   const { step } = body;
+
+  let complete = false;
+  try { complete = isSetupComplete(); } catch { /* DB not yet accessible */ }
+
+  let hasUser = false;
+  if (step !== 'azure') {
+    try {
+      const session = await getSession();
+      hasUser = !!session.user;
+    } catch { /* session not configured */ }
+  }
+
+  const deny = assertSetupPostAllowed(complete, step, hasUser);
+  if (deny) return NextResponse.json({ error: deny.error }, { status: deny.status });
 
   // ── Step 1: Azure AD ──────────────────────────────────────────────────────
   if (step === 'azure') {

@@ -14,6 +14,22 @@ export function shouldSkipZipEntry(entryName: string): boolean {
   return false;
 }
 
+const BINARY_IMPORT_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp',
+  '.intunewin', '.zip', '.woff', '.woff2', '.ttf', '.otf',
+  '.pdf', '.exe', '.dll', '.bin',
+]);
+
+export type ZipImportEncoding = 'utf-8' | 'base64';
+
+/** True for app icons and other binaries that must not be decoded as UTF-8. */
+export function isBinaryImportPath(filePath: string): boolean {
+  const n = normalizeZipEntryName(filePath);
+  const dot = n.lastIndexOf('.');
+  if (dot < 0 || n.lastIndexOf('/') > dot) return false;
+  return BINARY_IMPORT_EXTENSIONS.has(n.slice(dot).toLowerCase());
+}
+
 export function applyImportPathPrefix(prefix: string, relPath: string): string {
   const p = prefix.replace(/\/$/, '');
   return p ? `${p}/${relPath}` : relPath;
@@ -37,15 +53,17 @@ function hoistRepoRootConfig(path: string): string {
 export interface ZipImportFile {
   path: string;
   content: string;
+  /** Default utf-8. Binary zip entries must use base64 so PNG/JPEG bytes survive. */
+  encoding?: ZipImportEncoding;
 }
 
 export function buildImportFileList(
   entries: ZipImportFile[],
   pathPrefix: string,
 ): ZipImportFile[] {
-  return entries.map(({ path, content }) => ({
-    path: applyImportPathPrefix(pathPrefix, path),
-    content,
+  return entries.map((e) => ({
+    ...e,
+    path: applyImportPathPrefix(pathPrefix, e.path),
   }));
 }
 
@@ -83,30 +101,30 @@ export function normalizeBaselineImportPaths(
   entries: ZipImportFile[],
   pathPrefix = '',
 ): ZipImportFile[] {
-  let files = entries.map(({ path, content }) => ({
-    path: normalizeZipEntryName(path),
-    content,
+  let files = entries.map((e) => ({
+    ...e,
+    path: normalizeZipEntryName(e.path),
   }));
 
   for (let i = 0; i < 3; i++) {
     files = stripSingleZipRoot(files);
-    files = files.map(({ path, content }) => ({
-      path: path
+    files = files.map((e) => ({
+      ...e,
+      path: e.path
         .replace(/^baseline\/baseline\//, 'baseline/')
         .replace(/^baseline\/baseline-remove\//, 'baseline-remove/'),
-      content,
     }));
   }
 
-  files = files.map(({ path, content }) => ({
+  files = files.map((e) => ({
+    ...e,
     path: hoistRepoRootConfig(
-      !path.startsWith('baseline/') && !path.startsWith('baseline-remove/')
-        ? isBaselineRepoRootPath(path)
-          ? path
-          : applyImportPathPrefix('baseline', path)
-        : path,
+      !e.path.startsWith('baseline/') && !e.path.startsWith('baseline-remove/')
+        ? isBaselineRepoRootPath(e.path)
+          ? e.path
+          : applyImportPathPrefix('baseline', e.path)
+        : e.path,
     ),
-    content,
   }));
 
   if (pathPrefix.trim()) {

@@ -6,7 +6,7 @@
     "CreatedBy", "LastModifiedBy", "ModifiedBy", "ManuallyModified",
     "RuleVersion", "Size", "RegexSize",
     "ObjectState", "ObjectCategory", "ObjectClass",
-    "ExchangeVersion", "AdminDisplayVersion", "AdminDisplayName",
+    "ExchangeVersion", "DirectoryObjectVersion", "AdminDisplayVersion", "AdminDisplayName",
     "IsValid", "IsDefault", "IsRuleConfigurationSupported", "RuleConfigurationUnsupportedReason",
     "ActivationDate", "ExpiryDate",
     "_PolicyType", "_PolicyName", "Name",

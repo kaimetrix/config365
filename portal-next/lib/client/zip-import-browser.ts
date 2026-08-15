@@ -4,6 +4,7 @@ import {
   shouldSkipZipEntry,
   normalizeZipEntryName,
   finalizeImportPaths,
+  isBinaryImportPath,
   ZIP_IMPORT_MAX_BYTES,
   type ZipImportFile,
 } from '@/lib/zip-import';
@@ -25,9 +26,12 @@ export async function extractZipInBrowser(file: File): Promise<ZipImportFile[]> 
 
   for (const [rawName, entry] of Object.entries(zip.files)) {
     if (entry.dir || shouldSkipZipEntry(rawName)) continue;
+    const path = normalizeZipEntryName(rawName);
+    const binary = isBinaryImportPath(path);
     files.push({
-      path: normalizeZipEntryName(rawName),
-      content: await entry.async('string'),
+      path,
+      content: await entry.async(binary ? 'base64' : 'string'),
+      encoding: binary ? 'base64' : 'utf-8',
     });
   }
 

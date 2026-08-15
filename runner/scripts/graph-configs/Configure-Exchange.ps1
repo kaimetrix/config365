@@ -380,6 +380,12 @@ foreach ($file in $policyFiles) {
     $monitorConfig = Get-MonitorConfig -BaselineFilePath $file.FullName
     if ($monitorConfig) {
         $configHash = Apply-MonitorFilter -PolicyObject $configHash -MonitorConfig $monitorConfig
+        # Nested exclude paths (AllowedSenders.Sender) must drop the whole cmdlet parameter
+        foreach ($k in (Get-MonitorExcludeTopLevelKeys -MonitorConfig $monitorConfig)) {
+            if ($configHash -is [System.Collections.IDictionary] -and $configHash.ContainsKey($k)) {
+                $configHash.Remove($k) | Out-Null
+            }
+        }
         # Restore internal routing fields if the include filter stripped them
         if (-not $configHash.ContainsKey("_PolicyName")) { $configHash["_PolicyName"] = $savedPolicyName }
         if (-not $configHash.ContainsKey("_PolicyType")) { $configHash["_PolicyType"] = $savedPolicyType }
@@ -705,8 +711,8 @@ function Set-ExchangePolicy {
     if (-not $policyType -and $PolicyConfig.Type) { $policyType = $PolicyConfig.Type }
     if (-not $policyName -and $PolicyConfig.Name) { $policyName = $PolicyConfig.Name.Trim() }
 
-    # Derive flat exclude list from monitor config for passing to ConvertTo-ComparableHashtable
-    $monitorExclude = if ($MonitorConfig -and $MonitorConfig.ContainsKey('Exclude')) { @($MonitorConfig['Exclude']) } else { @() }
+    # First path segment only — ConvertTo-ComparableHashtable matches top-level keys
+    $monitorExclude = @(Get-MonitorExcludeTopLevelKeys -MonitorConfig $MonitorConfig)
 
     $displayLabel = if ($PolicyConfig._PolicyDisplayName) { $PolicyConfig._PolicyDisplayName } else { $policyName }
     

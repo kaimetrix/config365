@@ -5,6 +5,15 @@ import type { TreeEntry } from '@/lib/server/gitea';
 import type { Tenant } from '@/lib/server/tenant-store';
 import { sortKeysDeep, stripMetadataFields, normalizeZeroLike, stripNullAndEmpty, normalizeFieldTypes } from '@/lib/normalize-for-compare';
 import {
+  type MonitorConfig,
+  getSidecarPath,
+  getFolderSidecarPath,
+  isPathIgnored,
+  isPathIncluded,
+  mergeMonitorConfigs,
+  applyFieldFilter,
+} from '@/lib/monitor-config';
+import {
   AUDIT_STATUS_PATH,
   ORG_AUDIT_DISABLED_PATH,
   REMEDIATION_PATH,
@@ -25,62 +34,6 @@ interface Props {
 }
 
 type ViewerTreeEntry = TreeEntry & { baselineOnly?: boolean };
-
-type MonitorConfig = { include?: string[]; exclude?: string[] } | null;
-
-/* ── Sidecar path helpers ─────────────────────────────────── */
-
-function getSidecarPath(filePath: string): string {
-  return filePath.replace(/\.json$/i, '.monitor.json');
-}
-
-function getFolderSidecarPath(filePath: string): string {
-  const dir = filePath.includes('/') ? filePath.split('/').slice(0, -1).join('/') : '';
-  return dir ? `${dir}/_default.monitor.json` : '_default.monitor.json';
-}
-
-/* ── Monitor config helpers ───────────────────────────────── */
-
-/**
- * Returns true if the dot-notation path is excluded by the monitor config.
- * - exclude list: ignored if path matches or is a descendant
- * - include list: ignored if path is NOT the target, not under it, not an ancestor of it
- */
-function isPathIgnored(path: string | null, config: MonitorConfig): boolean {
-  if (!path || !config) return false;
-  if (config.exclude?.length) {
-    if (config.exclude.some(e => path === e || path.startsWith(e + '.'))) return true;
-  }
-  if (config.include?.length) {
-    return !config.include.some(
-      e => path === e || path.startsWith(e + '.') || e.startsWith(path + '.')
-    );
-  }
-  return false;
-}
-
-function isPathIncluded(path: string | null, config: MonitorConfig): boolean {
-  if (!path || !config?.include?.length) return false;
-  return config.include.some(
-    e => path === e || path.startsWith(e + '.') || e.startsWith(path + '.')
-  );
-}
-
-function mergeMonitorConfigs(fileConfig: MonitorConfig, folderConfig: MonitorConfig): MonitorConfig {
-  if (!fileConfig && !folderConfig) return null;
-  if (!fileConfig) return folderConfig;
-  if (!folderConfig) return fileConfig;
-  const fInc = fileConfig.include  ?? [];
-  const fExc = fileConfig.exclude  ?? [];
-  const dInc = folderConfig.include ?? [];
-  const dExc = folderConfig.exclude ?? [];
-  const inc = [...new Set([...fInc, ...dInc.filter(p => !fExc.includes(p))])];
-  const exc = [...new Set([...fExc, ...dExc.filter(p => !fInc.includes(p))])];
-  const r: MonitorConfig = {};
-  if (inc.length) r!.include = inc;
-  if (exc.length) r!.exclude = exc;
-  return (inc.length || exc.length) ? r : null;
-}
 
 /* ── JSON normalization (for drift comparison) ────────────── */
 
@@ -106,70 +59,6 @@ function normalizeForCompare(rawStr: string, config: MonitorConfig, filePath?: s
   } catch {
     return rawStr;
   }
-}
-
-/* ── JSON field filter (apply include/exclude) ────────────── */
-
-function applyFieldFilter(
-  obj: unknown,
-  filter: { include?: string[]; exclude?: string[] },
-): unknown {
-  if (!filter.include?.length && !filter.exclude?.length) return obj;
-  if (obj === null || typeof obj !== 'object') return obj;
-  if (Array.isArray(obj)) return obj.map(item => applyFieldFilter(item, filter));
-
-  const record = obj as Record<string, unknown>;
-
-  function getByPath(o: Record<string, unknown>, path: string): unknown {
-    const parts = path.split('.');
-    let cur: unknown = o;
-    for (const part of parts) {
-      if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return undefined;
-      cur = (cur as Record<string, unknown>)[part];
-    }
-    return cur;
-  }
-
-  function setByPath(o: Record<string, unknown>, path: string, value: unknown): void {
-    const parts = path.split('.');
-    let cur = o;
-    for (let i = 0; i < parts.length - 1; i++) {
-      if (!(parts[i] in cur) || cur[parts[i]] === null || typeof cur[parts[i]] !== 'object') {
-        cur[parts[i]] = {};
-      }
-      cur = cur[parts[i]] as Record<string, unknown>;
-    }
-    cur[parts[parts.length - 1]] = value;
-  }
-
-  function deleteByPath(o: Record<string, unknown>, path: string): void {
-    const parts = path.split('.');
-    let cur: unknown = o;
-    for (let i = 0; i < parts.length - 1; i++) {
-      if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return;
-      cur = (cur as Record<string, unknown>)[parts[i]];
-    }
-    if (cur && typeof cur === 'object' && !Array.isArray(cur)) {
-      delete (cur as Record<string, unknown>)[parts[parts.length - 1]];
-    }
-  }
-
-  let result: Record<string, unknown>;
-  if (filter.include?.length) {
-    result = {};
-    for (const path of filter.include) {
-      const val = getByPath(record, path);
-      if (val !== undefined) setByPath(result, path, val);
-    }
-  } else {
-    result = { ...record };
-  }
-
-  if (filter.exclude?.length) {
-    for (const path of filter.exclude) deleteByPath(result, path);
-  }
-
-  return result;
 }
 
 /* ── JSON line annotation ────────────────────────────────── */

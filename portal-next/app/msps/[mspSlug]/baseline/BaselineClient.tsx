@@ -2,6 +2,14 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import type { TreeEntry } from '@/lib/server/gitea';
+import {
+  type MonitorConfig,
+  getSidecarPath,
+  getFolderSidecarPath,
+  isPathIgnored,
+  isPathIncluded,
+  mergeMonitorConfigs,
+} from '@/lib/monitor-config';
 
 type TabId = 'deploy' | 'remove' | 'groups';
 
@@ -16,36 +24,44 @@ interface Tenant { slug: string; displayName: string }
 interface Props { mspSlug: string; deployTree: TreeEntry[]; removeTree: TreeEntry[]; giteaOrg: string; tenants: Tenant[] }
 
 // ─── Monitor types ─────────────────────────────────────────────────────────────
-type MonitorConfig = { include?: string[]; exclude?: string[] } | null;
 interface MonitorPanelState { include: string[]; exclude: string[] }
 
-// ─── Monitor helpers ──────────────────────────────────────────────────────────
-function getSidecarPath(fp: string) { return fp.replace(/\.json$/i, '.monitor.json'); }
-function getFolderSidecarPath(fp: string) {
-  const dir = fp.includes('/') ? fp.split('/').slice(0, -1).join('/') : '';
-  return dir ? `${dir}/_default.monitor.json` : '_default.monitor.json';
+function monitorStateEqual(a: MonitorPanelState, b: MonitorPanelState): boolean {
+  return JSON.stringify({ i: [...a.include].sort(), e: [...a.exclude].sort() })
+    === JSON.stringify({ i: [...b.include].sort(), e: [...b.exclude].sort() });
 }
-function isPathIgnored(path: string | null, config: MonitorConfig): boolean {
-  if (!path || !config) return false;
-  if (config.exclude?.length) {
-    if (config.exclude.some(e => path === e || path.startsWith(e + '.'))) return true;
+
+async function persistBaselineMonitorSidecar(
+  mspSlug: string,
+  sidecarPath: string,
+  state: MonitorPanelState,
+  sha: string | undefined,
+): Promise<string | undefined> {
+  const cfg: Record<string, string[]> = {};
+  if (state.include.length) cfg.include = state.include;
+  if (state.exclude.length) cfg.exclude = state.exclude;
+  const hasConfig = Object.keys(cfg).length > 0;
+  if (!hasConfig) {
+    if (sha) {
+      const res = await fetch('/api/git/file', {
+        method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: sidecarPath, sha, scope: 'baseline', mspSlug, message: `portal: clear monitor config for ${sidecarPath}` }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error ?? 'Delete failed');
+    }
+    return undefined;
   }
-  if (config.include?.length) {
-    return !config.include.some(e => path === e || path.startsWith(e + '.') || e.startsWith(path + '.'));
-  }
-  return false;
-}
-function isPathIncluded(path: string | null, config: MonitorConfig): boolean {
-  if (!path || !config?.include?.length) return false;
-  return config.include.some(e => path === e || path.startsWith(e + '.') || e.startsWith(path + '.'));
-}
-function mergeMonitorConfigs(fileConfig: MonitorConfig, folderConfig: MonitorConfig): MonitorConfig {
-  if (!fileConfig && !folderConfig) return null;
-  if (!fileConfig) return folderConfig;
-  if (!folderConfig) return fileConfig;
-  const inc = [...new Set([...(fileConfig.include ?? []), ...(folderConfig.include ?? []).filter(p => !(fileConfig.exclude ?? []).includes(p))])];
-  const exc = [...new Set([...(fileConfig.exclude ?? []), ...(folderConfig.exclude ?? []).filter(p => !(fileConfig.include ?? []).includes(p))])];
-  return (inc.length || exc.length) ? { ...(inc.length ? { include: inc } : {}), ...(exc.length ? { exclude: exc } : {}) } : null;
+  const content = JSON.stringify(cfg, null, 2) + '\n';
+  const chk = await fetch(`/api/git/file?path=${encodeURIComponent(sidecarPath)}&scope=baseline&mspSlug=${mspSlug}`);
+  const chkd = await chk.json();
+  const res = await fetch('/api/git/file', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: sidecarPath, content, sha: chkd.exists ? chkd.sha : undefined, scope: 'baseline', mspSlug, message: `portal: update monitor config for ${sidecarPath}` }),
+  });
+  if (!res.ok) throw new Error((await res.json()).error ?? 'Save failed');
+  const nc = await fetch(`/api/git/file?path=${encodeURIComponent(sidecarPath)}&scope=baseline&mspSlug=${mspSlug}`);
+  const nd = await nc.json();
+  return nd.sha as string | undefined;
 }
 
 // ─── JSON line annotation ─────────────────────────────────────────────────────
@@ -188,13 +204,42 @@ interface BMonitorPanelProps {
   folderState: MonitorPanelState;
   fileSha: string | undefined;
   folderSha: string | undefined;
+  openTick?: number;
+  savedTick?: number;
   onUpdate: (fs: MonitorPanelState, ds: MonitorPanelState, fsha?: string, dsha?: string) => void;
 }
 
-function BMonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, folderSha, onUpdate }: BMonitorPanelProps) {
+function BMonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, folderSha, openTick, savedTick, onUpdate }: BMonitorPanelProps) {
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState<'file' | 'folder' | null>(null);
   const [msg, setMsg] = useState('');
+  const [savedFile, setSavedFile] = useState(fileState);
+  const [savedFolder, setSavedFolder] = useState(folderState);
+
+  useEffect(() => {
+    setOpen(false);
+    setMsg('');
+  }, [filePath]);
+
+  useEffect(() => {
+    setSavedFile(fileState);
+    setSavedFolder(folderState);
+    setMsg('');
+    // Parent bumps savedTick after load or a successful persist — snapshot then, not on every chip edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedTick, filePath]);
+
+  useEffect(() => {
+    if (openTick && openTick > 0) setOpen(true);
+  }, [openTick]);
+
+  const fileDirty = !monitorStateEqual(fileState, savedFile);
+  const folderDirty = !monitorStateEqual(folderState, savedFolder);
+  const anyDirty = fileDirty || folderDirty;
+
+  useEffect(() => {
+    if (anyDirty) setOpen(true);
+  }, [anyDirty]);
 
   const fileSP   = getSidecarPath(filePath);
   const folderSP = getFolderSidecarPath(filePath);
@@ -211,40 +256,18 @@ function BMonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, fol
     const st  = scope === 'file' ? fileState : folderState;
     const sp  = scope === 'file' ? fileSP : folderSP;
     const sha = scope === 'file' ? fileSha : folderSha;
-    const cfg: Record<string, string[]> = {};
-    if (st.include.length) cfg.include = st.include;
-    if (st.exclude.length) cfg.exclude = st.exclude;
-    const hasConfig = Object.keys(cfg).length > 0;
     try {
-      if (!hasConfig) {
-        if (sha) {
-          await fetch('/api/git/file', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: sp, sha, scope: 'baseline', mspSlug, message: `portal: clear monitor config for ${sp}` }) });
-        }
-        onUpdate(
-          scope === 'file' ? { include: [], exclude: [] } : fileState,
-          scope === 'folder' ? { include: [], exclude: [] } : folderState,
-          scope === 'file' ? undefined : fileSha,
-          scope === 'folder' ? undefined : folderSha,
-        );
-      } else {
-        const content = JSON.stringify(cfg, null, 2) + '\n';
-        const chk = await fetch(`/api/git/file?path=${encodeURIComponent(sp)}&scope=baseline&mspSlug=${mspSlug}`);
-        const chkd = await chk.json();
-        const res = await fetch('/api/git/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: sp, content, sha: chkd.exists ? chkd.sha : undefined, scope: 'baseline', mspSlug, message: `portal: update monitor config for ${sp}` }) });
-        if (!res.ok) throw new Error((await res.json()).error);
-        const nc = await fetch(`/api/git/file?path=${encodeURIComponent(sp)}&scope=baseline&mspSlug=${mspSlug}`);
-        const nd = await nc.json();
-        onUpdate(
-          scope === 'file'   ? st          : fileState,
-          scope === 'folder' ? st          : folderState,
-          scope === 'file'   ? nd.sha      : fileSha,
-          scope === 'folder' ? nd.sha      : folderSha,
-        );
-      }
-      setMsg('Saved');
-      setTimeout(() => setMsg(''), 2000);
+      const newSha = await persistBaselineMonitorSidecar(mspSlug, sp, st, sha);
+      onUpdate(
+        scope === 'file' ? st : fileState,
+        scope === 'folder' ? st : folderState,
+        scope === 'file' ? newSha : fileSha,
+        scope === 'folder' ? newSha : folderSha,
+      );
+      if (scope === 'file') setSavedFile(st);
+      else setSavedFolder(st);
+      setMsg('Saved to Git');
+      setTimeout(() => setMsg(''), 2500);
     } catch (e: unknown) {
       setMsg(e instanceof Error ? e.message : 'Error');
     } finally { setSaving(null); }
@@ -279,11 +302,14 @@ function BMonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, fol
     );
   }
 
-  function SidecarSection({ label, pathHint, state, scope }: { label: string; pathHint: string; state: MonitorPanelState; scope: 'file' | 'folder' }) {
+  function SidecarSection({ label, pathHint, state, scope, dirty }: { label: string; pathHint: string; state: MonitorPanelState; scope: 'file' | 'folder'; dirty: boolean }) {
     const isEmpty = !state.include.length && !state.exclude.length;
     return (
-      <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e1e21' }}>
-        <div style={{ fontSize: '0.6rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#52525b', marginBottom: 4 }}>{label}</div>
+      <div style={{ padding: '10px 14px', borderBottom: '1px solid #1e1e21', background: dirty ? 'rgba(234,179,8,0.04)' : undefined }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+          <div style={{ fontSize: '0.6rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#52525b' }}>{label}</div>
+          {dirty && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#fbbf24', background: 'rgba(234,179,8,0.12)', border: '1px solid rgba(234,179,8,0.3)', borderRadius: 4, padding: '1px 6px' }}>Unsaved</span>}
+        </div>
         <div style={{ fontSize: '0.6rem', color: '#3f3f46', fontFamily: 'monospace', marginBottom: 6, wordBreak: 'break-all' }}>baseline/{pathHint}</div>
         {isEmpty ? (
           <div style={{ fontSize: '0.72rem', color: '#3f3f46', fontStyle: 'italic', marginBottom: 6 }}>No config — click JSON fields above to add</div>
@@ -303,10 +329,26 @@ function BMonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, fol
             )}
           </div>
         )}
+        {dirty && (
+          <div style={{ fontSize: '0.72rem', color: '#fbbf24', marginBottom: 8 }}>
+            Not written to Git yet — click <strong>Save to Git</strong> to keep these fields.
+          </div>
+        )}
         <div style={{ display: 'flex', gap: 6 }}>
-          <button onClick={() => saveSidecar(scope)} disabled={saving === scope}
-            style={{ padding: '4px 10px', fontSize: '0.72rem', background: 'rgba(167,139,250,0.12)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.3)', borderRadius: 4, cursor: saving === scope ? 'not-allowed' : 'pointer', fontFamily: 'inherit', opacity: saving === scope ? 0.5 : 1 }}>
-            {saving === scope ? 'Saving…' : 'Save'}
+          <button onClick={() => saveSidecar(scope)} disabled={saving === scope || !dirty}
+            style={{
+              padding: dirty ? '5px 14px' : '4px 10px',
+              fontSize: '0.72rem',
+              fontWeight: dirty ? 700 : 400,
+              background: dirty ? '#22c55e' : 'rgba(167,139,250,0.12)',
+              color: dirty ? '#000' : '#a78bfa',
+              border: dirty ? 'none' : '1px solid rgba(167,139,250,0.3)',
+              borderRadius: 4,
+              cursor: saving === scope || !dirty ? 'not-allowed' : 'pointer',
+              fontFamily: 'inherit',
+              opacity: saving === scope ? 0.5 : dirty ? 1 : 0.45,
+            }}>
+            {saving === scope ? 'Saving…' : dirty ? 'Save to Git' : 'Saved'}
           </button>
           {!isEmpty && (
             <button onClick={() => clearAll(scope)} style={{ padding: '4px 10px', fontSize: '0.72rem', background: 'rgba(239,68,68,0.1)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 4, cursor: 'pointer', fontFamily: 'inherit' }}>
@@ -326,12 +368,13 @@ function BMonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, fol
         <span style={{ fontSize: '0.7rem', color: hasAnyConfig ? '#a78bfa' : '#3f3f46', background: hasAnyConfig ? 'rgba(167,139,250,0.1)' : 'transparent', border: hasAnyConfig ? '1px solid rgba(167,139,250,0.2)' : 'none', borderRadius: 4, padding: hasAnyConfig ? '1px 6px' : '0', marginLeft: 4 }}>
           {summary}
         </span>
-        {msg && <span style={{ fontSize: '0.7rem', color: '#86efac', marginLeft: 'auto' }}>{msg}</span>}
+        {anyDirty && <span style={{ fontSize: '0.65rem', fontWeight: 700, color: '#fbbf24', background: 'rgba(234,179,8,0.12)', border: '1px solid rgba(234,179,8,0.3)', borderRadius: 4, padding: '1px 6px' }}>Unsaved</span>}
+        {msg && <span style={{ fontSize: '0.7rem', color: msg.startsWith('Error') || msg.includes('fail') ? '#fca5a5' : '#86efac', marginLeft: 'auto' }}>{msg}</span>}
       </div>
       {open && (
         <div style={{ borderTop: '1px solid #1e1e21' }}>
-          <SidecarSection label="File-level config" pathHint={fileSP}   state={fileState}   scope="file" />
-          <SidecarSection label="Folder default"    pathHint={folderSP} state={folderState} scope="folder" />
+          <SidecarSection label="File-level config" pathHint={fileSP}   state={fileState}   scope="file"   dirty={fileDirty} />
+          <SidecarSection label="Folder default"    pathHint={folderSP} state={folderState} scope="folder" dirty={folderDirty} />
         </div>
       )}
     </div>
@@ -358,6 +401,8 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
 
   // Monitor sidecar state
   const [monitorConfig, setMonitorConfig]           = useState<MonitorConfig>(null);
+  const [monitorOpenTick, setMonitorOpenTick]       = useState(0);
+  const [monitorSavedTick, setMonitorSavedTick]     = useState(0);
   const [fileMonitorState, setFileMonitorState]     = useState<MonitorPanelState>({ include: [], exclude: [] });
   const [folderMonitorState, setFolderMonitorState] = useState<MonitorPanelState>({ include: [], exclude: [] });
   const [fileSidecarSha, setFileSidecarSha]         = useState<string | undefined>();
@@ -408,6 +453,7 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
     setFolderMonitorState({ include: [], exclude: [] });
     setFileSidecarSha(undefined);
     setFolderSidecarSha(undefined);
+    setMonitorSavedTick(t => t + 1);
   }
 
   // ── Sidecar loading ──────────────────────────────────────────────────────────
@@ -426,6 +472,7 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
     setFileMonitorState({ include: fileCfg?.include ?? [], exclude: fileCfg?.exclude ?? [] });
     setFolderMonitorState({ include: folderCfg?.include ?? [], exclude: folderCfg?.exclude ?? [] });
     setMonitorConfig(mergeMonitorConfigs(fileCfg, folderCfg));
+    setMonitorSavedTick(t => t + 1);
   }
 
   // ── File loading ─────────────────────────────────────────────────────────────
@@ -731,27 +778,44 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
     setScopeOpen(false);
   }, []);
 
-  function applyToMonitor(type: 'include' | 'exclude', scope: 'file' | 'folder') {
+  async function applyToMonitor(type: 'include' | 'exclude', scope: 'file' | 'folder') {
     const paths = getMinimalPaths(selectedPaths);
-    if (scope === 'file') {
-      setFileMonitorState(prev => {
-        const next = { ...prev, [type]: [...new Set([...prev[type], ...paths])] };
-        const fileCfg: MonitorConfig = next.include.length || next.exclude.length ? { include: next.include, exclude: next.exclude } : null;
-        const folderCfg: MonitorConfig = folderMonitorState.include.length || folderMonitorState.exclude.length ? { include: folderMonitorState.include, exclude: folderMonitorState.exclude } : null;
-        setMonitorConfig(mergeMonitorConfigs(fileCfg, folderCfg));
-        return next;
-      });
-    } else {
-      setFolderMonitorState(prev => {
-        const next = { ...prev, [type]: [...new Set([...prev[type], ...paths])] };
-        const fileCfg: MonitorConfig = fileMonitorState.include.length || fileMonitorState.exclude.length ? { include: fileMonitorState.include, exclude: fileMonitorState.exclude } : null;
-        const folderCfg: MonitorConfig = next.include.length || next.exclude.length ? { include: next.include, exclude: next.exclude } : null;
-        setMonitorConfig(mergeMonitorConfigs(fileCfg, folderCfg));
-        return next;
-      });
-    }
+    const nextFile = scope === 'file'
+      ? { ...fileMonitorState, [type]: [...new Set([...fileMonitorState[type], ...paths])] }
+      : fileMonitorState;
+    const nextFolder = scope === 'folder'
+      ? { ...folderMonitorState, [type]: [...new Set([...folderMonitorState[type], ...paths])] }
+      : folderMonitorState;
+    const next = scope === 'file' ? nextFile : nextFolder;
+    const fileCfg: MonitorConfig = nextFile.include.length || nextFile.exclude.length ? { include: nextFile.include, exclude: nextFile.exclude } : null;
+    const folderCfg: MonitorConfig = nextFolder.include.length || nextFolder.exclude.length ? { include: nextFolder.include, exclude: nextFolder.exclude } : null;
+
+    setFileMonitorState(nextFile);
+    setFolderMonitorState(nextFolder);
+    setMonitorConfig(mergeMonitorConfigs(fileCfg, folderCfg));
     setSelectedPaths(new Set());
     setScopeOpen(false);
+    setMonitorOpenTick(t => t + 1);
+    setError('');
+    setSuccess(scope === 'file' ? 'Saving file monitor sidecar…' : 'Saving folder monitor sidecar…');
+
+    try {
+      const sidecarPath = scope === 'file' ? getSidecarPath(selectedPath!) : getFolderSidecarPath(selectedPath!);
+      const newSha = await persistBaselineMonitorSidecar(
+        mspSlug,
+        sidecarPath,
+        next,
+        scope === 'file' ? fileSidecarSha : folderSidecarSha,
+      );
+      handleMonitorUpdate(nextFile, nextFolder, scope === 'file' ? newSha : fileSidecarSha, scope === 'folder' ? newSha : folderSidecarSha);
+      setMonitorSavedTick(t => t + 1);
+      setSuccess(scope === 'file'
+        ? `Saved ${paths.length} field${paths.length !== 1 ? 's' : ''} to this file monitor sidecar.`
+        : `Saved ${paths.length} field${paths.length !== 1 ? 's' : ''} to the folder monitor sidecar.`);
+    } catch (e: unknown) {
+      setSuccess('');
+      setError(e instanceof Error ? e.message : 'Failed to save monitor sidecar');
+    }
   }
 
   // ── Monitor panel update handler ─────────────────────────────────────────────
@@ -958,8 +1022,8 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
                             <div style={{ padding: '4px 0' }}>
                               <div style={{ padding: '4px 12px 2px', fontSize: '0.6rem', fontWeight: 700, color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.08em' }}>This file</div>
                               {([
-                                { label: '✓ Monitor selected fields', sub: 'include (file)', color: '#e4e4e7', fn: () => applyToMonitor('include', 'file') },
-                                { label: '✕ Ignore selected fields',  sub: 'exclude (file)', color: '#fca5a5', fn: () => applyToMonitor('exclude', 'file') },
+                                { label: '✓ Monitor selected fields', sub: 'include + save this file sidecar', color: '#e4e4e7', fn: () => { void applyToMonitor('include', 'file'); } },
+                                { label: '✕ Ignore selected fields',  sub: 'exclude + save this file sidecar', color: '#fca5a5', fn: () => { void applyToMonitor('exclude', 'file'); } },
                               ] as const).map((item, i) => (
                                 <button key={i} onClick={item.fn}
                                   style={{ width: '100%', padding: '8px 12px', textAlign: 'left', background: 'transparent', border: 'none', color: item.color, fontSize: '0.8125rem', cursor: 'pointer', fontFamily: 'inherit', display: 'block' }}
@@ -972,8 +1036,8 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
                               <div style={{ height: 1, background: '#27272a', margin: '4px 0' }} />
                               <div style={{ padding: '4px 12px 2px', fontSize: '0.6rem', fontWeight: 700, color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Entire folder</div>
                               {([
-                                { label: '✓ Monitor selected fields', sub: 'include (folder)', color: '#e4e4e7', fn: () => applyToMonitor('include', 'folder') },
-                                { label: '✕ Ignore selected fields',  sub: 'exclude (folder)', color: '#fca5a5', fn: () => applyToMonitor('exclude', 'folder') },
+                                { label: '✓ Monitor selected fields', sub: 'include + save folder sidecar', color: '#e4e4e7', fn: () => { void applyToMonitor('include', 'folder'); } },
+                                { label: '✕ Ignore selected fields',  sub: 'exclude + save folder sidecar', color: '#fca5a5', fn: () => { void applyToMonitor('exclude', 'folder'); } },
                               ] as const).map((item, i) => (
                                 <button key={i} onClick={item.fn}
                                   style={{ width: '100%', padding: '8px 12px', textAlign: 'left', background: 'transparent', border: 'none', color: item.color, fontSize: '0.8125rem', cursor: 'pointer', fontFamily: 'inherit', display: 'block' }}
@@ -1127,7 +1191,7 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
             {isDeployJson && !loading && content && !isEditMode && (
               hasSelection ? (
                 <div style={{ padding: '3px 16px', flexShrink: 0, fontSize: '0.7rem', color: '#a78bfa' }}>
-                  {selectionCount} field{selectionCount !== 1 ? 's' : ''} selected — use &quot;Apply to {selectionCount} field{selectionCount !== 1 ? 's' : ''} ▾&quot; to add to monitor config
+                  {selectionCount} field{selectionCount !== 1 ? 's' : ''} selected — Apply writes the sidecar to Git immediately
                 </div>
               ) : (
                 <div style={{ padding: '3px 16px', flexShrink: 0, fontSize: '0.7rem', color: '#3f3f46' }}>
@@ -1188,6 +1252,8 @@ export default function BaselineClient({ mspSlug, deployTree, removeTree, giteaO
                     folderState={folderMonitorState}
                     fileSha={fileSidecarSha}
                     folderSha={folderSidecarSha}
+                    openTick={monitorOpenTick}
+                    savedTick={monitorSavedTick}
                     onUpdate={handleMonitorUpdate}
                   />
                   {content ? renderAnnotatedJson(content) : <div style={{ padding: 24, color: '#52525b', fontSize: '0.8125rem' }}>File is empty</div>}

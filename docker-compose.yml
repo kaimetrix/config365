@@ -19,7 +19,7 @@ services:
       GITEA_RUNNER_NAME: ${GITEA_RUNNER_NAME:-config365-runner}
       RUNNER_SHARDS: ${RUNNER_SHARDS:-4}
       PLATFORM_ADMIN_OIDS: ${PLATFORM_ADMIN_OIDS:-}
-      SECURE_COOKIES: ${SECURE_COOKIES:-false}
+      SECURE_COOKIES: ${SECURE_COOKIES:-}
       PUBLIC_URL: ${PUBLIC_URL:-}
       DEBUG_PIPELINE_TEMPLATES_DIR: /debug-staging/pipeline-templates
     volumes:

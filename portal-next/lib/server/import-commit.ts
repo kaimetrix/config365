@@ -51,6 +51,8 @@ async function importViaSequentialPut(
       file.content,
       `${message}: ${file.path}`,
       existing.exists ? existing.sha : undefined,
+      'main',
+      file.encoding === 'base64',
     );
     imported++;
     onProgress?.(imported);

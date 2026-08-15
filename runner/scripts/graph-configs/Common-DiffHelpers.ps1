@@ -209,6 +209,87 @@ function New-ChangesObject {
 
 <#
 .SYNOPSIS
+    Coerce include/exclude values to a real [string[]] (never a scalar string).
+    A single-element JSON array becomes a string after Select-Object -Unique;
+    foreach on that string walks characters and silently fails to delete keys.
+#>
+function _MF_ToStringArray {
+    param($Value)
+    # Return List[string], never [string[]]. PowerShell unwraps a one-element
+    # [string[]] to a scalar, and "$a + $b" then concatenates
+    # "AllowedSenders"+"DirectoryObjectVersion" into one bogus exclude key.
+    $list = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Value) { return ,$list }
+    if ($Value -is [string]) {
+        if (-not [string]::IsNullOrWhiteSpace($Value)) { $list.Add($Value) }
+        return ,$list
+    }
+    foreach ($item in $Value) {
+        if ($null -eq $item) { continue }
+        if ($item -is [string]) {
+            if (-not [string]::IsNullOrWhiteSpace($item)) { $list.Add($item) }
+            continue
+        }
+        # Nested enumerables (Object[] / string[]) — recurse, never "$item"
+        # which joins arrays with $OFS into a single path.
+        foreach ($nested in (_MF_ToStringArray $item)) { $list.Add($nested) }
+    }
+    # Wrap the List so PowerShell does not enumerate it on return (a one-item
+    # List would otherwise become a scalar string at the caller).
+    return ,$list
+}
+
+<#
+.SYNOPSIS
+    True when $Path equals a prefix or is a descendant (prefix + '.').
+#>
+function _MF_PathCoveredBy {
+    param(
+        [string]$Path,
+        [string[]]$Prefixes
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or $null -eq $Prefixes -or $Prefixes.Count -eq 0) { return $false }
+    foreach ($p in $Prefixes) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        if ($Path.Equals($p, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($Path.StartsWith($p + '.', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+<#
+.SYNOPSIS
+    Drop includes covered by an exclude prefix and coerce both lists to [string[]].
+#>
+function _MF_FinalizeMonitorConfig {
+    param(
+        $Include,
+        $Exclude
+    )
+    $inc = _MF_ToStringArray $Include
+    $exc = _MF_ToStringArray $Exclude
+    $excSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $excOut = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $exc) {
+        if ($excSeen.Add($p)) { $excOut.Add($p) }
+    }
+    $incSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $incOut = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $inc) {
+        if (_MF_PathCoveredBy $p ([string[]]$excOut.ToArray())) { continue }
+        if ($incSeen.Add($p)) { $incOut.Add($p) }
+    }
+    $result = @{}
+    # Store [string[]] inside a hashtable — the indexer keeps the type so a
+    # single-element list is not later unwrapped back to a scalar string.
+    if ($incOut.Count -gt 0) { $result['Include'] = [string[]]$incOut.ToArray() }
+    if ($excOut.Count -gt 0) { $result['Exclude'] = [string[]]$excOut.ToArray() }
+    if ($result.Count -gt 0) { return $result }
+    return $null
+}
+
+<#
+.SYNOPSIS
     Internal helper — parses a single .monitor.json file into a hashtable.
     Returns @{ Include=@(...); Exclude=@(...) } or $null if absent/invalid.
 #>
@@ -218,15 +299,13 @@ function _ReadMonitorConfigFile {
     try {
         $raw    = Get-Content $Path -Raw -ErrorAction Stop
         $parsed = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
-        $result = @{}
-        if ($parsed.ContainsKey('include') -and $parsed['include'].Count -gt 0) {
-            $result['Include'] = @($parsed['include'])
-        }
-        if ($parsed.ContainsKey('exclude') -and $parsed['exclude'].Count -gt 0) {
-            $result['Exclude'] = @($parsed['exclude'])
-        }
-        if ($result.Count -eq 0) { return $null }
-        return $result
+        $inc = $null
+        $exc = $null
+        if ($parsed.ContainsKey('include')) { $inc = $parsed['include'] }
+        elseif ($parsed.ContainsKey('Include')) { $inc = $parsed['Include'] }
+        if ($parsed.ContainsKey('exclude')) { $exc = $parsed['exclude'] }
+        elseif ($parsed.ContainsKey('Exclude')) { $exc = $parsed['Exclude'] }
+        return _MF_FinalizeMonitorConfig $inc $exc
     }
     catch {
         Write-Host "##[warning]Failed to read monitor config at $Path`: $_"
@@ -240,10 +319,10 @@ function _ReadMonitorConfigFile {
 
 .DESCRIPTION
     Both configs are active simultaneously. The file-level config wins on conflicts:
-    - Folder include entries blocked by a file-level exclude are dropped.
-    - Folder exclude entries blocked by a file-level include are dropped.
-    Pure additions from either side are always kept. Returns $null when the
-    merged result has no active rules.
+    - Folder include entries blocked by a file-level exclude (exact or prefix) are dropped.
+    - Folder exclude entries blocked by a file-level include (exact or prefix) are dropped.
+    After merge, any include covered by an exclude prefix is dropped (exclude wins).
+    Returns $null when the merged result has no active rules.
 #>
 function Merge-MonitorConfigs {
     param(
@@ -251,22 +330,25 @@ function Merge-MonitorConfigs {
         [hashtable]$FolderConfig
     )
     if (-not $FileConfig -and -not $FolderConfig) { return $null }
-    if (-not $FileConfig)   { return $FolderConfig }
-    if (-not $FolderConfig) { return $FileConfig }
+    if (-not $FileConfig)   { return _MF_FinalizeMonitorConfig $FolderConfig['Include'] $FolderConfig['Exclude'] }
+    if (-not $FolderConfig) { return _MF_FinalizeMonitorConfig $FileConfig['Include'] $FileConfig['Exclude'] }
 
-    $fInc = if ($FileConfig.ContainsKey('Include'))   { @($FileConfig['Include'])   } else { @() }
-    $fExc = if ($FileConfig.ContainsKey('Exclude'))   { @($FileConfig['Exclude'])   } else { @() }
-    $dInc = if ($FolderConfig.ContainsKey('Include')) { @($FolderConfig['Include']) } else { @() }
-    $dExc = if ($FolderConfig.ContainsKey('Exclude')) { @($FolderConfig['Exclude']) } else { @() }
+    $fInc = _MF_ToStringArray $(if ($FileConfig.ContainsKey('Include'))   { $FileConfig['Include']   } else { $null })
+    $fExc = _MF_ToStringArray $(if ($FileConfig.ContainsKey('Exclude'))   { $FileConfig['Exclude']   } else { $null })
+    $dInc = _MF_ToStringArray $(if ($FolderConfig.ContainsKey('Include')) { $FolderConfig['Include'] } else { $null })
+    $dExc = _MF_ToStringArray $(if ($FolderConfig.ContainsKey('Exclude')) { $FolderConfig['Exclude'] } else { $null })
 
-    $mergedInc = @($fInc + ($dInc | Where-Object { $_ -notin $fExc })) | Select-Object -Unique
-    $mergedExc = @($fExc + ($dExc | Where-Object { $_ -notin $fInc })) | Select-Object -Unique
-
-    $result = @{}
-    if ($mergedInc.Count -gt 0) { $result['Include'] = $mergedInc }
-    if ($mergedExc.Count -gt 0) { $result['Exclude'] = $mergedExc }
-    if ($result.Count -gt 0) { return $result }
-    return $null
+    $mergedInc = [System.Collections.Generic.List[string]]::new()
+    $mergedExc = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $fInc) { $mergedInc.Add($p) }
+    foreach ($p in $fExc) { $mergedExc.Add($p) }
+    foreach ($p in $dInc) {
+        if (-not (_MF_PathCoveredBy $p ([string[]]$fExc.ToArray()))) { $mergedInc.Add($p) }
+    }
+    foreach ($p in $dExc) {
+        if (-not (_MF_PathCoveredBy $p ([string[]]$fInc.ToArray()))) { $mergedExc.Add($p) }
+    }
+    return _MF_FinalizeMonitorConfig $mergedInc $mergedExc
 }
 
 <#
@@ -292,7 +374,26 @@ function Get-MonitorConfig {
     $folderDefault = Join-Path ([System.IO.Path]::GetDirectoryName($BaselineFilePath)) '_default.monitor.json'
     $fileConfig    = _ReadMonitorConfigFile $sidecarPath
     $folderConfig  = _ReadMonitorConfigFile $folderDefault
-    return Merge-MonitorConfigs -FileConfig $fileConfig -FolderConfig $folderConfig
+    $merged        = Merge-MonitorConfigs -FileConfig $fileConfig -FolderConfig $folderConfig
+    $inc = if ($merged -and $merged.ContainsKey('Include')) { (_MF_ToStringArray $merged['Include']) -join ', ' } else { '' }
+    $exc = if ($merged -and $merged.ContainsKey('Exclude')) { (_MF_ToStringArray $merged['Exclude']) -join ', ' } else { '' }
+    Write-Host "##[debug]Monitor $(Split-Path $BaselineFilePath -Leaf): fileSidecar=$sidecarPath ($([bool]$fileConfig)) folderSidecar=$folderDefault ($([bool]$folderConfig)) include=[$inc] exclude=[$exc]"
+    return $merged
+}
+
+<#
+.SYNOPSIS
+    First path segment of every exclude entry (AllowedSenders.Sender → AllowedSenders).
+#>
+function Get-MonitorExcludeTopLevelKeys {
+    param([hashtable]$MonitorConfig)
+    if (-not $MonitorConfig -or -not $MonitorConfig.ContainsKey('Exclude')) { return [string[]]@() }
+    $keys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in (_MF_ToStringArray $MonitorConfig['Exclude'])) {
+        $top = ($path -split '\.')[0]
+        if (-not [string]::IsNullOrWhiteSpace($top)) { [void]$keys.Add($top) }
+    }
+    return [string[]]@($keys)
 }
 
 <#
@@ -363,33 +464,46 @@ function Apply-MonitorFilter {
         $cur[$Parts[-1]] = $Value
     }
 
-    # Helper: delete nested key by dot-notation path
+    # Helper: delete nested key by dot-notation path; remove empty parents
     function _MF_Delete {
         param($Obj, [string[]]$Parts)
         $cur = $Obj
+        $stack = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $Parts.Count - 1; $i++) {
             $part = $Parts[$i]
             if ($null -eq $cur -or -not ($cur -is [System.Collections.IDictionary]) -or -not $cur.ContainsKey($part)) { return }
+            $stack.Add(@{ Dict = $cur; Key = $part })
             $cur = $cur[$part]
         }
         if ($cur -is [System.Collections.IDictionary]) { $cur.Remove($Parts[-1]) | Out-Null }
+        for ($i = $stack.Count - 1; $i -ge 0; $i--) {
+            $parent = $stack[$i].Dict
+            $key    = $stack[$i].Key
+            $child  = $parent[$key]
+            if ($child -is [System.Collections.IDictionary] -and $child.Count -eq 0) {
+                $parent.Remove($key) | Out-Null
+            }
+            else { break }
+        }
     }
 
     $result = $clone
+    $includePaths = _MF_ToStringArray $(if ($MonitorConfig.ContainsKey('Include')) { $MonitorConfig['Include'] } else { $null })
+    $excludePaths = _MF_ToStringArray $(if ($MonitorConfig.ContainsKey('Exclude')) { $MonitorConfig['Exclude'] } else { $null })
 
-    if ($MonitorConfig.ContainsKey('Include') -and $MonitorConfig['Include'].Count -gt 0) {
-        $filtered = [ordered]@{}
-        foreach ($path in $MonitorConfig['Include']) {
-            $parts = $path -split '\.'
+    if ($includePaths.Count -gt 0) {
+        $filtered = @{}
+        foreach ($path in $includePaths) {
+            $parts = @($path -split '\.')
             $val = _MF_Get $clone $parts
             if ($null -ne $val) { _MF_Set $filtered $parts $val }
         }
         $result = $filtered
     }
 
-    if ($MonitorConfig.ContainsKey('Exclude') -and $MonitorConfig['Exclude'].Count -gt 0) {
-        foreach ($path in $MonitorConfig['Exclude']) {
-            $parts = $path -split '\.'
+    if ($excludePaths.Count -gt 0) {
+        foreach ($path in $excludePaths) {
+            $parts = @($path -split '\.')
             _MF_Delete $result $parts
         }
     }

@@ -31,13 +31,18 @@ password ${TOKEN}
 NETRC
 chmod 600 /root/.netrc
 
-git config --global credential.helper store
 printf 'http://%s:%s@%s\n' "${ADMIN_USER}" "${TOKEN}" "${GITEA_HOST}" > /root/.git-credentials
 chmod 600 /root/.git-credentials
-git config --global url."http://${ADMIN_USER}:${TOKEN}@${GITEA_HOST}/".insteadOf "http://${GITEA_HOST}/"
-# Copied into each job's isolated HOME by Initialize Job Session Isolation.
-# Prevents "fatal: detected dubious ownership" when /data vs /home bind-mount
-# paths disagree on the act_runner hostexecutor workspace.
-git config --global --add safe.directory '*'
+# Rewrite .gitconfig in full — `git config --global url.*.insteadOf` appends, and a
+# stale token left from a previous regen makes every `git clone http://localhost:3000/...` fail.
+cat > /root/.gitconfig << GITCONFIG
+[credential]
+	helper = store
+[url "http://${ADMIN_USER}:${TOKEN}@${GITEA_HOST}/"]
+	insteadOf = http://${GITEA_HOST}/
+[safe]
+	directory = *
+GITCONFIG
+chmod 600 /root/.gitconfig
 
 echo "[git-creds] Configured git credentials for act_runner (user=${ADMIN_USER}, host=${GITEA_HOST})."

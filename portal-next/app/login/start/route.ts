@@ -48,8 +48,9 @@ export async function GET(request: Request) {
     return NextResponse.redirect(dest);
   }
 
+  const secure = process.env.SECURE_COOKIES === 'true';
   const response = NextResponse.redirect(authUrl);
-  response.cookies.set('pkce_verifier', verifier, { httpOnly: true, sameSite: 'lax', maxAge: 600, path: '/' });
-  response.cookies.set('pkce_state',    state,    { httpOnly: true, sameSite: 'lax', maxAge: 600, path: '/' });
+  response.cookies.set('pkce_verifier', verifier, { httpOnly: true, secure, sameSite: 'lax', maxAge: 600, path: '/' });
+  response.cookies.set('pkce_state',    state,    { httpOnly: true, secure, sameSite: 'lax', maxAge: 600, path: '/' });
   return response;
 }

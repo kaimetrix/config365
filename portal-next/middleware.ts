@@ -22,8 +22,6 @@ const PUBLIC_PATHS = [
   '/api/health',
   // token-api → portal tenant lookup (auth via Bearer SESSION_SECRET on the route)
   '/api/internal',
-  '/reset',
-  '/api/reset',
   '/favicon.svg',
   '/favicon.ico',
   '/robots.txt',

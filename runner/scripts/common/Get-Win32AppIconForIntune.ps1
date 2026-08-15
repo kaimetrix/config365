@@ -30,26 +30,49 @@ function Get-Win32AppIconMimeType {
     }
 }
 
+function Get-Win32AppIconMagicKind {
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -ge 8) {
+        $png = [byte[]]@(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        $isPng = $true
+        for ($i = 0; $i -lt 8; $i++) {
+            if ($Bytes[$i] -ne $png[$i]) { $isPng = $false; break }
+        }
+        if ($isPng) { return 'png' }
+    }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xD8 -and $Bytes[2] -eq 0xFF) {
+        return 'jpeg'
+    }
+    return $null
+}
+
 function Get-Win32AppIconMimeContentHashtable {
     param([Parameter(Mandatory = $true)][string]$IconPath)
     $maxBytes = 512 * 1024
     $bytes    = [IO.File]::ReadAllBytes($IconPath)
-    $mimeType = Get-Win32AppIconMimeType -IconPath $IconPath
+    $kind     = Get-Win32AppIconMagicKind -Bytes $bytes
 
-    # Graph rejects icons with "Icon in invalid format" unless the PNG is 8-bit
-    # truecolor+alpha. Indexed/paletted PNGs (e.g. produced by pngquant/TinyPNG/many
-    # icon exporters) are perfectly valid PNGs but fail that check. Normalize
-    # in-memory at upload time rather than requiring a specially-encoded source file.
-    if ($mimeType -eq 'image/png') {
+    if ($kind -eq 'jpeg') {
+        $mimeType = 'image/jpeg'
+    } elseif ($kind -eq 'png') {
+        $mimeType = 'image/png'
+        # Graph rejects icons with "Icon in invalid format" unless the PNG is 8-bit
+        # truecolor+alpha. Indexed/paletted PNGs (e.g. produced by pngquant/TinyPNG/many
+        # icon exporters) are perfectly valid PNGs but fail that check. Normalize
+        # in-memory at upload time rather than requiring a specially-encoded source file.
         try {
             $normalized = ConvertTo-TrueColorPngBytes -PngBytes $bytes
         } catch {
-            throw "Icon '$IconPath' could not be normalized for Intune upload: $_"
+            Write-Host "  Warning: Icon '$IconPath' could not be normalized for Intune upload ($_). Skipping icon." -ForegroundColor Yellow
+            return $null
         }
         if (-not [Object]::ReferenceEquals($normalized, $bytes)) {
             Write-Host "  Icon '$([IO.Path]::GetFileName($IconPath))' is not an 8-bit truecolor PNG — converted for Intune compatibility" -ForegroundColor DarkGray
         }
         $bytes = $normalized
+    } else {
+        Write-Host "  Warning: Icon '$IconPath' is not a valid PNG or JPEG (often caused by a text ZIP import). Skipping icon." -ForegroundColor Yellow
+        return $null
     }
 
     if ($bytes.Length -gt $maxBytes) {
@@ -68,7 +91,9 @@ function Get-Win32AppIconJsonFragment {
     # win32LobApp (via mobileApp) only defines "largeIcon" — there is no "smallIcon" property
     # in the Graph schema. Sending it causes Graph to reject the request with
     # "Icon in invalid format".
-    $iconJson = (Get-Win32AppIconMimeContentHashtable -IconPath $IconPath | ConvertTo-Json -Compress -Depth 3)
+    $ht = Get-Win32AppIconMimeContentHashtable -IconPath $IconPath
+    if (-not $ht) { return '' }
+    $iconJson = ($ht | ConvertTo-Json -Compress -Depth 3)
     return "  `"largeIcon`": $iconJson,`n"
 }
 
@@ -411,6 +436,7 @@ function Add-Win32AppIconToPatchBody {
     )
     if (-not $IconPath -or -not (Test-Path -LiteralPath $IconPath)) { return $Body }
     # Only "largeIcon" is a valid mobileApp/win32LobApp property — see note above.
-    $Body.largeIcon = Get-Win32AppIconMimeContentHashtable -IconPath $IconPath
+    $ht = Get-Win32AppIconMimeContentHashtable -IconPath $IconPath
+    if ($ht) { $Body.largeIcon = $ht }
     return $Body
 }

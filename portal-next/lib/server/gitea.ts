@@ -854,7 +854,8 @@ export async function getCommitDiff(owner: string, repo: string, sha: string): P
 
 export interface BatchFileEntry {
   path:    string;
-  content: string; // UTF-8
+  content: string; // UTF-8 text, or base64 when encoding is 'base64'
+  encoding?: 'utf-8' | 'base64';
 }
 
 /**
@@ -896,7 +897,9 @@ export async function batchPutFiles(
           files: slice.map((file) => ({
             operation: 'upload',
             path: file.path,
-            content: Buffer.from(file.content, 'utf-8').toString('base64'),
+            content: file.encoding === 'base64'
+              ? file.content
+              : Buffer.from(file.content, 'utf-8').toString('base64'),
           })),
         }),
       },

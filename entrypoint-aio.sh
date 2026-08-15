@@ -18,6 +18,8 @@
 #   RUNNER_SHARDS           Parallel host-mode workers (default: 4, max 8)
 #   RUNNER_MODE             sharded (default) or docker (local dev with docker.sock)
 #   PLATFORM_ADMIN_OIDS     Comma-separated Entra ID OIDs for emergency admin access
+#   PUBLIC_URL              Public origin (https://… on Azure). Used for OAuth and Secure cookies.
+#   SECURE_COOKIES          Optional override (true|false). Unset: true when PUBLIC_URL is https.
 
 set -e
 
@@ -500,6 +502,18 @@ if [ -n "${PUBLIC_URL:-}" ]; then
 else
   echo "[aio-init] PUBLIC_URL unset — portal will derive origin from proxy headers."
 fi
+
+# Secure cookies follow the *public* origin (browser HTTPS), not the HTTP hop
+# Azure uses from the front door into this container.
+if [ -z "${SECURE_COOKIES:-}" ]; then
+  case "$(printf '%s' "${PUBLIC_URL:-}" | tr 'A-Z' 'a-z')" in
+    https://*) SECURE_COOKIES=true ;;
+    *)         SECURE_COOKIES=false ;;
+  esac
+fi
+sed -i "s|^environment=NODE_ENV=.*|&,SECURE_COOKIES=\"${SECURE_COOKIES}\"|" /etc/supervisord.conf
+echo "[aio-init] SECURE_COOKIES=${SECURE_COOKIES} (from public URL, not container HTTP)."
+
 if [ -n "${CONFIG365_PERSIST_DIR:-}" ]; then
   sed -i "s|^environment=NODE_ENV=.*|&,CONFIG365_PERSIST_DIR=\"${CONFIG365_PERSIST_DIR}\"|" /etc/supervisord.conf
 fi

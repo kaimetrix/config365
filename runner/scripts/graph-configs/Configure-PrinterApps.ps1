@@ -540,6 +540,8 @@ try {
         $appNameToFile[$intuneAppName] = $configPath
         $runAsAccount  = if ($config.runAsAccount -eq 'user') { 'user' } else { 'system' }
         $appFolder     = Split-Path $configPath -Parent
+
+        try {
         $iconFilePath  = Resolve-Win32AppIconPath -AppFolderPath $appFolder -Config $config
         $iconHash      = Get-Win32AppIconHash -IconPath $iconFilePath
         $iconFragment  = Get-Win32AppIconJsonFragment -IconPath $iconFilePath
@@ -604,7 +606,6 @@ $iconFragment  "description": $jDescription,
 }
 "@
 
-        try {
             $lookup   = Find-ExistingWin32AppForConfig -Config $config -PackageId $appName -Prefix 'Printer' -GetExisting ${function:Get-ExistingWin32App}
             $existing = $lookup.Existing
             if ($lookup.WasLegacyName) {

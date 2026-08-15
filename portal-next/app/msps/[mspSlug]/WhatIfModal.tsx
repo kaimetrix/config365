@@ -2,6 +2,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { toGiteaWebUrl } from '@/lib/utils';
 import { normalizeForCompare } from '@/lib/normalize-for-compare';
+import {
+  applyFieldFilter,
+  getFolderSidecarPath,
+  getSidecarPath,
+  mergeMonitorConfigs,
+  parseMonitorConfig,
+} from '@/lib/monitor-config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -597,22 +604,31 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
 
     async function fetchFirst(
       paths: string[], prefix: string, params: string
-    ): Promise<{ exists: boolean; content?: string }> {
+    ): Promise<{ exists: boolean; content?: string; path?: string }> {
       for (const p of paths) {
         const url = `/api/git/file?${params}&path=${encodeURIComponent(`${prefix}/${p}`)}`;
         const data = await fetch(url).then(r => r.json()).catch(() => ({ exists: false })) as { exists?: boolean; content?: string };
-        if (data.exists) return data as { exists: boolean; content?: string };
+        if (data.exists) return { exists: true, content: data.content, path: p };
       }
       return { exists: false };
     }
 
+    async function fetchBaselineFile(relPath: string): Promise<string | undefined> {
+      const url = `/api/git/file?scope=baseline&mspSlug=${encodeURIComponent(mspSlug)}&path=${encodeURIComponent(`baseline/${relPath}`)}`;
+      const data = await fetch(url).then(r => r.json()).catch(() => ({ exists: false })) as { exists?: boolean; content?: string };
+      return data.exists ? data.content : undefined;
+    }
+
     // Normalize using the same pipeline as the deploy comparison:
     // strips API-only fields (per compare-ignore-fields/*.json), drops nulls,
-    // sorts keys + arrays — so only real value differences show in the diff.
-    const fmt = (s: string | undefined, relPath: string) => {
+    // sorts keys + arrays, then applies the merged monitor sidecar so excluded
+    // fields (e.g. AllowedSenders) do not appear as deploy diffs.
+    const fmt = (s: string | undefined, relPath: string, monitor: { include?: string[]; exclude?: string[] } | null) => {
       try {
         const normalized = normalizeForCompare(s ?? '{}', relPath);
-        return JSON.stringify(JSON.parse(normalized), null, 2);
+        const parsed = JSON.parse(normalized) as unknown;
+        const filtered = monitor ? applyFieldFilter(parsed, monitor) : parsed;
+        return JSON.stringify(filtered, null, 2);
       } catch { return s ?? ''; }
     };
     Promise.all([
@@ -621,15 +637,19 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
       fetch(`/api/git/resolve-variables?slug=${encodeURIComponent(tenantSlug)}`)
         .then(r => r.json())
         .catch(() => ({ variables: {} })) as Promise<{ variables?: Record<string, string> }>,
-    ]).then(([bl, tn, varsRes]) => {
-      // Use the first successfully resolved path as the relPath for normalization
-      const relPath = relPaths[0];
+    ]).then(async ([bl, tn, varsRes]) => {
+      const relPath = bl.path ?? tn.path ?? relPaths[0];
+      const [fileSidecar, folderSidecar] = await Promise.all([
+        fetchBaselineFile(getSidecarPath(relPath)),
+        fetchBaselineFile(getFolderSidecarPath(relPath)),
+      ]);
+      const monitor = mergeMonitorConfigs(parseMonitorConfig(fileSidecar), parseMonitorConfig(folderSidecar));
       const resolvedVars = varsRes.variables ?? {};
       // Expand {{VAR:Name}} tokens to this tenant's resolved values before diffing,
       // so "Desired (baseline)" shows what will actually be deployed, not the raw token.
       const baselineContent = bl.exists && bl.content ? applyVariableTokens(bl.content, resolvedVars) : bl.content;
-      setBaselineJson(bl.exists ? fmt(baselineContent, relPath) : '(not found in baseline)');
-      setTenantJson(tn.exists ? fmt(tn.content, relPath) : '(not found in tenant backup)');
+      setBaselineJson(bl.exists ? fmt(baselineContent, relPath, monitor) : '(not found in baseline)');
+      setTenantJson(tn.exists ? fmt(tn.content, relPath, monitor) : '(not found in tenant backup)');
     }).catch(() => setFilesError('Failed to fetch files.'))
       .finally(() => setFilesLoading(false));
   }, [tab, baselineJson, tenantJson, item, mspOrg, tenantSlug]);

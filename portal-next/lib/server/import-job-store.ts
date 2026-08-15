@@ -7,6 +7,7 @@ import {
   finalizeImportPaths,
   normalizeZipEntryName,
   shouldSkipZipEntry,
+  isBinaryImportPath,
   type ZipImportFile,
 } from '@/lib/zip-import';
 import { commitImportFiles } from '@/lib/server/import-commit';
@@ -130,9 +131,10 @@ function normalizeBatchPaths(
   pathPrefix: string,
 ): BatchFileEntry[] {
   const entries = files
-    .map(({ path: p, content }) => ({
-      path: normalizeZipEntryName(p),
-      content,
+    .map((f) => ({
+      path: normalizeZipEntryName(f.path),
+      content: f.content,
+      encoding: f.encoding,
     }))
     .filter(({ path: p }) => !shouldSkipZipEntry(p));
 
@@ -167,7 +169,11 @@ export function stageImportBatch(
   for (const file of normalized) {
     const dest = stagedFilePath(jobId, file.path);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, file.content, 'utf-8');
+    if (file.encoding === 'base64') {
+      fs.writeFileSync(dest, Buffer.from(file.content, 'base64'));
+    } else {
+      fs.writeFileSync(dest, file.content, 'utf-8');
+    }
   }
 
   meta.uploadedFiles += normalized.length;
@@ -183,10 +189,19 @@ function listStagedFiles(jobId: string, dir: string, prefix = ''): BatchFileEntr
     if (fs.statSync(full).isDirectory()) {
       out.push(...listStagedFiles(jobId, full, rel.replace(/\\/g, '/')));
     } else {
-      out.push({
-        path: rel.replace(/\\/g, '/'),
-        content: fs.readFileSync(full, 'utf-8'),
-      });
+      const repoPath = rel.replace(/\\/g, '/');
+      if (isBinaryImportPath(repoPath)) {
+        out.push({
+          path: repoPath,
+          content: fs.readFileSync(full).toString('base64'),
+          encoding: 'base64',
+        });
+      } else {
+        out.push({
+          path: repoPath,
+          content: fs.readFileSync(full, 'utf-8'),
+        });
+      }
     }
   }
   return out;

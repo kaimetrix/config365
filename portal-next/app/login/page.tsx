@@ -16,10 +16,6 @@ export default async function LoginScreen({
 
   let setupDone = false;
   try { setupDone = isSetupComplete(); } catch { /* DB not ready */ }
-  if (!setupDone) redirect('/setup');
-
-  const session = await getSession();
-  if (session.user) redirect(returnTo);
 
   let authMode = 'oidc';
   let azureConfigured = false;
@@ -27,6 +23,14 @@ export default async function LoginScreen({
     authMode = getSetting('auth_mode') ?? 'oidc';
     azureConfigured = !!getSetting('azure_client_id');
   } catch { /* settings not ready */ }
+
+  // Incomplete setup: only bounce to the wizard when Azure AD is not ready yet.
+  // Wizard step 2 signs in via this page (and /login/start) before setup_complete is set.
+  // Easy Auth skips /login entirely (/auth/easyauth), which is why Azure App Service worked.
+  if (!setupDone && authMode !== 'easyauth' && !azureConfigured) redirect('/setup');
+
+  const session = await getSession();
+  if (session.user) redirect(returnTo);
 
   return (
     <LoginPage

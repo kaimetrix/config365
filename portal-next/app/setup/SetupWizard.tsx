@@ -143,7 +143,21 @@ export function SetupWizard({ defaults }: { defaults: SetupDefaults }) {
     <div style={{ margin: 0, background: '#09090b', color: '#e4e4e7', fontFamily: 'system-ui,sans-serif', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
       <div style={{ background: '#18181b', border: '1px solid #27272a', borderRadius: 12, padding: 40, maxWidth: 560, width: '100%' }}>
         <h1 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: 4 }}>Config365 Setup</h1>
-        <p style={{ color: '#71717a', fontSize: '0.85rem', marginBottom: 28 }}>Configure the platform before first use.</p>
+        <p style={{ color: '#71717a', fontSize: '0.85rem', marginBottom: 16 }}>Configure the platform before first use.</p>
+        <div style={{
+          background: 'rgba(234, 179, 8, 0.08)',
+          border: '1px solid rgba(234, 179, 8, 0.35)',
+          borderRadius: 8,
+          padding: '12px 14px',
+          fontSize: '0.8rem',
+          color: '#fde68a',
+          lineHeight: 1.5,
+          marginBottom: 28,
+        }}>
+          <strong style={{ color: '#facc15' }}>Isolated environment required.</strong>
+          {' '}Config365 is intended to run on a private network or otherwise isolated host.
+          It must not be published directly to the internet.
+        </div>
 
         {/* Progress bar */}
         <div style={{ display: 'flex', gap: 6, marginBottom: 28 }}>
@@ -233,7 +247,7 @@ export function SetupWizard({ defaults }: { defaults: SetupDefaults }) {
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={() => setStep('azure')} style={btnSecondary}>← Back</button>
               <button
-                onClick={() => { window.location.href = '/login?returnTo=/setup'; }}
+                onClick={() => { window.location.href = '/login/start?returnTo=/setup'; }}
                 style={btnPrimary(false)}
               >
                 Sign in with Microsoft →

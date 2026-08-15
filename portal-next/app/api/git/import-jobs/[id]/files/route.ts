@@ -34,11 +34,15 @@ export async function POST(request: NextRequest, ctx: RouteCtx) {
       return json({ error: 'files array is required' }, 400);
     }
 
-    const files = raw.map((item: { path?: string; content?: string }) => {
+    const files = raw.map((item: { path?: string; content?: string; encoding?: string }) => {
       if (!item?.path || typeof item.content !== 'string') {
         throw new Error('Each file entry requires path and content');
       }
-      return { path: item.path, content: item.content };
+      return {
+        path: item.path,
+        content: item.content,
+        encoding: item.encoding === 'base64' ? 'base64' as const : 'utf-8' as const,
+      };
     });
 
     const result = stageImportBatch(id, files);
