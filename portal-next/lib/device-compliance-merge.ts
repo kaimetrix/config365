@@ -3,6 +3,8 @@
  * into a unified device compliance row list.
  */
 
+import { resolveDeviceOsVersion } from './os-version-threshold';
+
 export interface ManagedDeviceRecord {
   id: string;
   deviceName?: string;
@@ -107,7 +109,7 @@ export function normalizeDeviceName(name: string | null | undefined): string {
 }
 
 function mdeOsVersion(mde: MdeDeviceRecord): string | null {
-  return mde.osVersion ?? mde.osBuild ?? null;
+  return resolveDeviceOsVersion(mde) || mde.osVersion || null;
 }
 
 function buildManagementType(flags: { mdm: boolean; mam: boolean; mde: boolean }): string {
@@ -203,7 +205,10 @@ export function mergeDeviceComplianceData(
       id: md.id || aadKey || md.deviceName || `intune-${rowsByKey.size}`,
       deviceName: md.deviceName ?? 'Unknown',
       platform: normalizePlatform(md.operatingSystem),
-      osVersion: md.osVersion ?? mamReg?.deviceOperatingSystemVersion ?? null,
+      osVersion: resolveDeviceOsVersion({ osVersion: md.osVersion })
+        || md.osVersion
+        || mamReg?.deviceOperatingSystemVersion
+        || null,
       patchVersion: mamReg?.patchVersion ?? null,
       managementType: buildManagementType({ mdm: true, mam: !!mamReg, mde: !!mdeMatch }),
       complianceState: md.complianceState ?? null,

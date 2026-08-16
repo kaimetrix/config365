@@ -70,6 +70,13 @@ export function appendSessionLog(session: UpdateSession, line: string): UpdateSe
   return session;
 }
 
+export function appendSessionLogLines(session: UpdateSession, lines: string[]): UpdateSession {
+  const ts = new Date().toISOString();
+  for (const line of lines) session.log.push(`[${ts}] ${line}`);
+  writeUpdateSession(session);
+  return session;
+}
+
 export function createUpdateSession(targetVersion: string): UpdateSession {
   const session: UpdateSession = {
     id: `upd-${Date.now()}`,

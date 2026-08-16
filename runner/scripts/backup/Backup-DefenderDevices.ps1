@@ -360,12 +360,21 @@ function Format-DeviceRecord {
         $MamPatchMap = $null   # optional MAM patch map from Get-MamPatchMap
     )
 
-    # Prefer Graph's operatingSystemVersion for mobile (MDE often returns null there)
-    $resolvedOsVersion = if ($GraphInfo -and $GraphInfo.operatingSystemVersion) {
-        $GraphInfo.operatingSystemVersion
-    } else {
-        $Device.osVersion
+    # Prefer a dotted numeric version. MDE Windows devices often have osVersion
+    # empty (or a label like "22H2") and the real build in osBuild (e.g. 22631).
+    $graphVersion = if ($GraphInfo) { [string]$GraphInfo.operatingSystemVersion } else { $null }
+    $mdeVersion   = if ($null -ne $Device.osVersion) { [string]$Device.osVersion } else { $null }
+    $osBuildRaw   = if ($null -ne $Device.osBuild) { [string]$Device.osBuild } else { $null }
+    $buildAsNt    = if ($osBuildRaw -match '^\d{5,}') { "10.0.$osBuildRaw" } else { $osBuildRaw }
+
+    $resolvedOsVersion = $null
+    foreach ($candidate in @($graphVersion, $mdeVersion, $buildAsNt)) {
+        if ($candidate -and ($candidate -match '^\d+(\.\d+)+$')) {
+            $resolvedOsVersion = $candidate
+            break
+        }
     }
+    if (-not $resolvedOsVersion) { $resolvedOsVersion = $mdeVersion }
 
     # Resolve Android security patch level from MAM registration (ISO date string, e.g. "2026-04-05").
     # Matched by azureADDeviceId because MDE computerDnsName ("lale_Android") differs from MAM deviceName ("Samsung SM-F741B").
@@ -513,11 +522,11 @@ try {
             } else { @() }
             if ($DebugMode) { Write-Log "  logon users retrieved ($($logonUsers.Count) entries); enriching if applicable..." 'DEBUG' }
 
-            # Enrich mobile and macOS devices via Graph.
-            # MDE returns osVersion = null for Android, iOS, and macOS; Graph's
-            # operatingSystemVersion is the reliable source for all three platforms.
+            # Enrich via Graph. MDE osVersion is null for Android/iOS/macOS and
+            # often empty for Windows (build lives in osBuild). Entra's
+            # operatingSystemVersion is the dotted value Intune compliance uses.
             $graphInfo = $null
-            if ($platformKey -in @('android', 'ios', 'macos') -and $device.aadDeviceId -and $graphToken) {
+            if ($platformKey -in @('android', 'ios', 'macos', 'windows') -and $device.aadDeviceId -and $graphToken) {
                 $graphInfo = Get-DeviceGraphInfo -AadDeviceId $device.aadDeviceId -GraphToken $graphToken
                 if ($graphInfo) { $results.GraphEnriched++ }
             }

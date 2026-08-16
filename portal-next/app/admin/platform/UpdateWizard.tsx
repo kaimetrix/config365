@@ -2,6 +2,18 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+interface UpdateSource {
+  channel: 'preview' | 'ga';
+  repo: string;
+  releasesUrl: string;
+  htmlUrl: string;
+  authenticated: boolean;
+  httpStatus?: number;
+  rateLimitRemaining?: string;
+  rateLimitLimit?: string;
+  error?: string;
+}
+
 interface UpdateCheck {
   installedAppVersion: string;
   installedPlatformVersion: number;
@@ -13,6 +25,8 @@ interface UpdateCheck {
   requiredPlatformVersion?: number;
   pendingMigrations?: Array<{ version: number; description: string }>;
   releaseNotes?: string;
+  source?: UpdateSource;
+  trace?: string[];
 }
 
 interface UpdateSession {
@@ -35,6 +49,24 @@ export default function UpdateWizard() {
   const [error, setError] = useState<string | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const pollingRef = useRef(false);
+  const logRef = useRef<HTMLPreElement>(null);
+
+  const logLines = session?.log?.length ? session.log : (check?.trace ?? []);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [logLines]);
+
+  const pollSessionLog = useCallback(async () => {
+    try {
+      const sessionRes = await fetch('/api/admin/platform/update/session');
+      if (!sessionRes.ok) return;
+      const sessionData = await sessionRes.json() as { session?: UpdateSession | null };
+      if (sessionData.session) setSession(sessionData.session);
+    } catch {
+      /* ignore poll errors */
+    }
+  }, []);
 
   const pollAfterRestart = useCallback(async () => {
     for (let i = 0; i < 30; i++) {
@@ -105,8 +137,18 @@ export default function UpdateWizard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'start' }),
       });
-      const data = await res.json() as { ok?: boolean; error?: string; session?: UpdateSession; blocked?: boolean };
-      if (!res.ok) throw new Error(data.error ?? 'Start failed');
+      const data = await res.json() as {
+        ok?: boolean;
+        error?: string;
+        session?: UpdateSession;
+        blocked?: boolean;
+        source?: UpdateSource;
+        trace?: string[];
+      };
+      if (data.source || data.trace) {
+        setCheck(prev => prev ? { ...prev, source: data.source ?? prev.source, trace: data.trace ?? prev.trace } : prev);
+      }
+      if (!res.ok) throw new Error(data.error ?? `Start failed (HTTP ${res.status})`);
       setSession(data.session ?? null);
       setWizardOpen(true);
     } catch (e) {
@@ -119,6 +161,7 @@ export default function UpdateWizard() {
   async function continueUpdate() {
     setLoading(true);
     setError(null);
+    const poll = setInterval(() => { void pollSessionLog(); }, 1000);
     try {
       const res = await fetch('/api/admin/platform/update/session', {
         method: 'POST',
@@ -140,6 +183,7 @@ export default function UpdateWizard() {
       setError((e as Error).message);
       await refresh();
     } finally {
+      clearInterval(poll);
       setLoading(false);
     }
   }
@@ -182,7 +226,7 @@ export default function UpdateWizard() {
       </div>
       <div className="card-body">
         {error && (
-          <p style={{ color: 'var(--danger-fg)', marginBottom: 12 }}>{error}</p>
+          <p className="msg-error" style={{ whiteSpace: 'pre-wrap' }}>{error}</p>
         )}
         {check && (
           <div style={{ marginBottom: 16, fontSize: '0.875rem' }}>
@@ -197,7 +241,39 @@ export default function UpdateWizard() {
                 )}
               </div>
             )}
-            {!check.updateAvailable && <div style={{ marginTop: 8, color: 'var(--success-fg)' }}>Up to date</div>}
+            {!check.updateAvailable && !check.source?.error && (
+              <div style={{ marginTop: 8, color: 'var(--success-fg)' }}>Up to date</div>
+            )}
+            {check.source?.error && !check.updateAvailable && (
+              <p className="msg-error" style={{ marginTop: 8 }}>
+                Could not check for updates: {check.source.error}
+              </p>
+            )}
+            {check.blocked && (
+              <p className="msg-error" style={{ marginTop: 12 }}>
+                Docker update required — v{check.latestVersion} needs platform v{check.requiredPlatformVersion}
+                {' '}(this instance is platform v{check.installedPlatformVersion}). Software update only applies
+                app (3rd-digit) releases.
+              </p>
+            )}
+            {check.source && (
+              <div style={{ marginTop: 12, fontSize: '0.8rem', color: 'var(--muted-fg)', display: 'grid', gap: 4 }}>
+                <div>
+                  Source: <code>{check.source.channel}</code>
+                  {' · '}
+                  <a href={check.source.htmlUrl} target="_blank" rel="noopener">{check.source.repo}</a>
+                  {' · '}
+                  <a href={check.source.releasesUrl} target="_blank" rel="noopener">{check.source.releasesUrl}</a>
+                </div>
+                <div>
+                  GitHub HTTP {check.source.httpStatus ?? 'n/a'}
+                  {check.source.authenticated ? ' · authenticated' : ' · anonymous'}
+                  {check.source.rateLimitRemaining != null && (
+                    <> · rate limit {check.source.rateLimitRemaining}/{check.source.rateLimitLimit ?? '?'}</>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -228,6 +304,11 @@ export default function UpdateWizard() {
                     Pending migrations after update: {check.pendingMigrations.map(m => `v${m.version}`).join(', ')}
                   </p>
                 )}
+                <p style={{ fontSize: '0.8rem', color: 'var(--muted-fg)', marginTop: 8 }}>
+                  Continue runs: GET GitHub release → download <code>config365-app-{session.targetVersion}.tar.gz</code>
+                  {' '}→ <code>tar -xzf</code> → <code>node run-migrations.mjs</code> → <code>ln -sfn</code>
+                  {' '}→ <code>supervisorctl restart portal token-api</code>
+                </p>
                 <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
                   <button type="button" className="btn btn-primary" onClick={continueUpdate} disabled={loading}>
                     Continue
@@ -293,12 +374,26 @@ export default function UpdateWizard() {
               </>
             )}
 
-            {session.log.length > 0 && (
-              <pre style={{ fontSize: '0.72rem', marginTop: 12, maxHeight: 120, overflow: 'auto', opacity: 0.85 }}>
-                {session.log.slice(-20).join('\n')}
-              </pre>
-            )}
           </div>
+        )}
+
+        {logLines.length > 0 && (
+          <pre
+            ref={logRef}
+            style={{
+              fontSize: '0.75rem',
+              marginTop: 16,
+              maxHeight: 320,
+              overflow: 'auto',
+              background: 'var(--surface-2)',
+              padding: 12,
+              borderRadius: 6,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}
+          >
+            {logLines.join('\n')}
+          </pre>
         )}
       </div>
     </div>

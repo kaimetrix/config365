@@ -1,3 +1,17 @@
+## [1.3.0] - 2026-08-16
+
+Platform rebuild: OS version control (MDM vs App Protection impact), Windows/macOS Intune-only preview, update-source and live update logs.
+
+### Changes
+- fix(ui): score mobile compliance against MDM devices only
+- feat(ui): scope mobile OS impact by MAM vs compliance and show block reason
+- fix(ui): count only Intune-managed Windows and macOS in OS impact
+- fix(ui): treat macOS versions with Darwin build suffixes as allowed
+- feat(ui): filter OS impact preview by last activity window
+- fix(ui): resolve Windows OS versions from Intune and Defender builds
+- feat(update): surface GitHub release source and live update logs
+- feat(ui): select OS threshold policies and show allowed device counts
+
 ## [1.2.0] - 2026-08-15
 
 Platform rebuild: new GHCR image with monitor exclude merge fix and prod changes since v1.1.2. Current preview image/setup does not work.

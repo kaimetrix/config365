@@ -29,6 +29,71 @@ import {
   type UpdateSession,
 } from './update-session';
 
+type UpdateLogger = (line: string) => void;
+
+function sessionLogger(session: UpdateSession): UpdateLogger {
+  return (line) => { appendSessionLog(session, line); };
+}
+
+function splitLogLines(text: string): string[] {
+  return text.replace(/\r\n/g, '\n').split('\n').filter(line => line.length > 0);
+}
+
+function formatCommand(file: string, args: string[]): string {
+  return [file, ...args].map(a => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ');
+}
+
+async function execLogged(
+  log: UpdateLogger,
+  file: string,
+  args: string[],
+  opts?: { env?: NodeJS.ProcessEnv },
+): Promise<{ stdout: string; stderr: string }> {
+  log(`$ ${formatCommand(file, args)}`);
+  try {
+    const { stdout, stderr } = await execFileAsync(file, args, {
+      ...opts,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    for (const line of splitLogLines(stdout)) log(`  ${line}`);
+    for (const line of splitLogLines(stderr)) log(`  [stderr] ${line}`);
+    if (!stdout.trim() && !stderr.trim()) log('  (no output)');
+    return { stdout, stderr };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message: string };
+    for (const line of splitLogLines(e.stdout ?? '')) log(`  ${line}`);
+    for (const line of splitLogLines(e.stderr ?? '')) log(`  [stderr] ${line}`);
+    log(`  [exit] ${e.message}`);
+    throw err;
+  }
+}
+
+async function fetchLogged(log: UpdateLogger, url: string, init?: RequestInit): Promise<Response> {
+  log(`$ GET ${url}`);
+  try {
+    const res = await fetch(url, init);
+    log(`  HTTP ${res.status} ${res.statusText || ''}`.trim());
+    const remaining = res.headers.get('x-ratelimit-remaining');
+    const limit = res.headers.get('x-ratelimit-limit');
+    if (remaining != null) log(`  rate-limit ${remaining}/${limit ?? '?'}`);
+    return res;
+  } catch (err) {
+    log(`  [error] ${(err as Error).message}`);
+    throw err;
+  }
+}
+import {
+  compareSemver,
+  emptySourceDebug,
+  formatBlockedUpdateError,
+  formatNoUpdateError,
+  githubReleaseTagUrl,
+  inferRequiredPlatformVersion,
+  repoForChannel,
+  type UpdateChannel,
+  type UpdateSourceDebug,
+} from '../update-source';
+
 const execFileAsync = promisify(execFile);
 
 export interface AppReleaseManifest {
@@ -53,6 +118,8 @@ export interface UpdateCheckResult {
   releaseNotes?: string;
   bumpType?: string;
   manifest?: AppReleaseManifest;
+  source: UpdateSourceDebug;
+  trace: string[];
 }
 
 const DATA_APP = '/data/app';
@@ -84,16 +151,13 @@ function ensureAppNodeModulesLink(): void {
   }
 }
 
-export type UpdateChannel = 'preview' | 'ga';
+export type { UpdateChannel, UpdateSourceDebug };
+export { formatBlockedUpdateError, formatNoUpdateError };
 
 export interface UpdateChannelSettings {
   channel: UpdateChannel;
   repoOverride: string | null;
   effectiveRepo: string;
-}
-
-function repoForChannel(channel: UpdateChannel): string {
-  return channel === 'ga' ? 'potsolutions/config365' : 'potsolutions/config365-preview';
 }
 
 function currentChannel(): UpdateChannel {
@@ -141,15 +205,29 @@ export function setUpdateChannelSettings(input: { channel?: UpdateChannel; repoO
   return getUpdateChannelSettings();
 }
 
+function githubToken(): string | undefined {
+  return getDecryptedSetting('github_release_token') ?? process.env.GITHUB_TOKEN ?? undefined;
+}
+
 function githubHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     'User-Agent': 'Config365-Updater',
   };
-  const token = getDecryptedSetting('github_release_token') ?? process.env.GITHUB_TOKEN;
   // Token optional — potsolutions release repos and GHCR packages are public.
+  const token = githubToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
+}
+
+function applyGithubResponseMeta(debug: UpdateSourceDebug, res: Response): void {
+  debug.httpStatus = res.status;
+  debug.rateLimitRemaining = res.headers.get('x-ratelimit-remaining') ?? undefined;
+  debug.rateLimitLimit = res.headers.get('x-ratelimit-limit') ?? undefined;
+}
+
+function currentSourceDebug(): UpdateSourceDebug {
+  return emptySourceDebug(currentChannel(), defaultRepo(), Boolean(githubToken()));
 }
 
 export async function getInstalledSchemaVersion(): Promise<number> {
@@ -193,23 +271,88 @@ export async function getPendingMigrations(): Promise<Array<{ version: number; d
   }
 }
 
-async function fetchLatestRelease(): Promise<{ tag: string; body: string; assets: Array<{ name: string; url: string }> } | null> {
-  const repo = defaultRepo();
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-    headers: githubHeaders(),
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`GitHub releases API ${res.status}: ${await res.text()}`);
+async function fetchLatestRelease(log: UpdateLogger): Promise<{
+  release: { tag: string; body: string; assets: Array<{ name: string; url: string }> } | null;
+  debug: UpdateSourceDebug;
+}> {
+  const debug = currentSourceDebug();
+  let res: Response;
+  try {
+    res = await fetchLogged(log, debug.releasesUrl, { headers: githubHeaders() });
+  } catch (err) {
+    debug.error = `Could not reach ${debug.releasesUrl}: ${(err as Error).message}`;
+    return { release: null, debug };
+  }
+  applyGithubResponseMeta(debug, res);
+  if (res.status === 404) {
+    debug.error = `No releases published on ${debug.repo} (${debug.releasesUrl})`;
+    log(`  ${debug.error}`);
+    return { release: null, debug };
+  }
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 300);
+    debug.error = `GitHub releases API ${res.status} for ${debug.releasesUrl}: ${body}`;
+    log(`  ${debug.error}`);
+    return { release: null, debug };
+  }
   const json = await res.json() as {
     tag_name: string;
     body: string;
     assets: Array<{ name: string; browser_download_url: string }>;
   };
+  const assets = json.assets.map(a => ({ name: a.name, url: a.browser_download_url }));
+  log(`  tag ${json.tag_name} · ${assets.length} asset(s): ${assets.map(a => a.name).join(', ') || '(none)'}`);
   return {
-    tag: json.tag_name.replace(/^v/, ''),
-    body: json.body ?? '',
-    assets: json.assets.map(a => ({ name: a.name, url: a.browser_download_url })),
+    debug,
+    release: {
+      tag: json.tag_name.replace(/^v/, ''),
+      body: json.body ?? '',
+      assets,
+    },
   };
+}
+
+async function fetchLightweightManifest(
+  assets: Array<{ name: string; url: string }>,
+  log: UpdateLogger,
+): Promise<Partial<AppReleaseManifest> | null> {
+  const asset = assets.find(a => a.name === 'platform-manifest.json' || a.name === 'manifest.json');
+  if (!asset) {
+    log('  no platform-manifest.json / manifest.json asset — inferring platform from version tag');
+    return null;
+  }
+  const res = await fetchLogged(log, asset.url, { headers: githubHeaders(), redirect: 'follow' });
+  if (!res.ok) {
+    log(`  manifest download failed HTTP ${res.status}`);
+    return null;
+  }
+  const json = await res.json() as {
+    appVersion?: string;
+    requiredPlatformVersion?: number;
+    platformVersion?: number;
+    requiredSchemaVersion?: number;
+    updateType?: 'app' | 'platform';
+    sha256?: Record<string, string>;
+  };
+  log(`  manifest ${asset.name}: platform=${json.requiredPlatformVersion ?? json.platformVersion ?? '?'} type=${json.updateType ?? '?'}`);
+  return {
+    appVersion: json.appVersion ?? '',
+    requiredPlatformVersion: json.requiredPlatformVersion ?? json.platformVersion,
+    requiredSchemaVersion: json.requiredSchemaVersion,
+    updateType: json.updateType,
+    sha256: json.sha256,
+  };
+}
+
+function applyPlatformRequirement(
+  result: UpdateCheckResult,
+  requiredPlatformVersion: number,
+): void {
+  result.requiredPlatformVersion = requiredPlatformVersion;
+  if (result.installedPlatformVersion < requiredPlatformVersion) {
+    result.blocked = true;
+    result.blockReason = 'platform_required';
+  }
 }
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
@@ -217,106 +360,116 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
   const installedPlatform = readInstalledPlatformVersion().platformVersion;
   const installedSchema = await getInstalledSchemaVersion();
   const pendingMigrations = await getPendingMigrations();
-
-  let latest: Awaited<ReturnType<typeof fetchLatestRelease>> = null;
-  try {
-    latest = await fetchLatestRelease();
-  } catch {
-    /* offline or unconfigured */
-  }
+  const source = currentSourceDebug();
+  const trace: string[] = [];
+  const log: UpdateLogger = line => { trace.push(line); };
 
   const result: UpdateCheckResult = {
     installedAppVersion: installedApp,
     installedPlatformVersion: installedPlatform,
     installedSchemaVersion: installedSchema,
-    latestVersion: latest?.tag ?? null,
+    latestVersion: null,
     updateAvailable: false,
     blocked: false,
     pendingMigrations,
-    releaseNotes: latest?.body,
+    source,
+    trace,
   };
 
-  if (!latest?.tag) return result;
+  log(`check channel=${source.channel} repo=${source.repo} auth=${source.authenticated ? 'token' : 'anonymous'}`);
+  log(`installed app=${installedApp} platform=v${installedPlatform} schema=v${installedSchema}`);
 
-  if (compareSemver(latest.tag, installedApp) <= 0) return result;
+  const fetched = await fetchLatestRelease(log);
+  Object.assign(source, fetched.debug);
+  const latest = fetched.release;
+
+  result.latestVersion = latest?.tag ?? null;
+  result.releaseNotes = latest?.body;
+
+  if (!latest?.tag) {
+    log(source.error ? `check failed: ${source.error}` : 'no latest release');
+    return result;
+  }
+  if (compareSemver(latest.tag, installedApp) <= 0) {
+    log(`v${latest.tag} is not newer than installed ${installedApp} — up to date`);
+    return result;
+  }
   result.updateAvailable = true;
 
-  try {
-    const manifest = await fetchManifestForVersion(latest.tag, latest.assets);
-    result.manifest = manifest;
-    result.requiredPlatformVersion = manifest.requiredPlatformVersion;
-    result.requiredSchemaVersion = manifest.requiredSchemaVersion;
-    result.bumpType = manifest.updateType;
+  // Infer from EPOCH.PLATFORM.APP so a platform bump is blocked even when the
+  // tarball/manifest cannot be downloaded during the check (the old path
+  // swallowed that failure and left Start update enabled).
+  applyPlatformRequirement(result, inferRequiredPlatformVersion(latest.tag));
+  result.bumpType = result.blocked ? 'platform' : 'app';
+  log(`inferred required platform v${result.requiredPlatformVersion} from tag v${latest.tag}`);
 
-    if (installedPlatform < manifest.requiredPlatformVersion) {
-      result.blocked = true;
-      result.blockReason = 'platform_required';
+  try {
+    const light = await fetchLightweightManifest(latest.assets, log);
+    if (light?.requiredPlatformVersion != null) {
+      applyPlatformRequirement(result, light.requiredPlatformVersion);
+      result.bumpType = light.updateType ?? result.bumpType;
+      result.requiredSchemaVersion = light.requiredSchemaVersion;
+      if (light.appVersion) {
+        result.manifest = {
+          appVersion: light.appVersion,
+          requiredPlatformVersion: light.requiredPlatformVersion,
+          requiredSchemaVersion: light.requiredSchemaVersion ?? 0,
+          updateType: light.updateType ?? (result.blocked ? 'platform' : 'app'),
+          sha256: light.sha256,
+        };
+      }
     }
-  } catch {
-    /* manifest optional until download */
+  } catch (err) {
+    source.error = `Release listed but manifest fetch failed: ${(err as Error).message}`;
+    log(`  [error] ${source.error}`);
+  }
+
+  if (result.blocked) {
+    log(`blocked: Docker update required (platform v${result.requiredPlatformVersion}, installed v${installedPlatform})`);
+  } else {
+    log(`app update available: ${installedApp} → ${latest.tag}`);
   }
 
   return result;
 }
 
-function compareSemver(a: string, b: string): number {
-  const pa = a.replace(/^v/, '').split('.').map(Number);
-  const pb = b.replace(/^v/, '').split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d !== 0) return d;
-  }
-  return 0;
-}
-
-async function fetchManifestForVersion(version: string, assets?: Array<{ name: string; url: string }>): Promise<AppReleaseManifest> {
-  const localManifest = join(RELEASES_DIR, version, 'manifest.json');
-  if (existsSync(localManifest)) {
-    return JSON.parse(readFileSync(localManifest, 'utf-8')) as AppReleaseManifest;
-  }
-  const assetName = `config365-app-${version}.tar.gz`;
-  const asset = assets?.find(a => a.name === assetName);
-  if (!asset) throw new Error(`Release asset ${assetName} not found`);
-  const tarPath = join(STAGING_DL, version, assetName);
-  mkdirSync(join(STAGING_DL, version), { recursive: true });
-  await downloadFile(asset.url, tarPath);
-  const extractDir = join(STAGING_DL, version, 'extract');
-  mkdirSync(extractDir, { recursive: true });
-  await execFileAsync('tar', ['-xzf', tarPath, '-C', extractDir]);
-  const manifestPath = join(extractDir, 'manifest.json');
-  if (!existsSync(manifestPath)) throw new Error('manifest.json missing from release');
-  return JSON.parse(readFileSync(manifestPath, 'utf-8')) as AppReleaseManifest;
-}
-
-async function downloadFile(url: string, dest: string): Promise<void> {
-  const res = await fetch(url, { headers: githubHeaders(), redirect: 'follow' });
-  if (!res.ok || !res.body) throw new Error(`Download failed ${res.status}`);
+async function downloadFile(url: string, dest: string, log: UpdateLogger): Promise<void> {
+  const res = await fetchLogged(log, url, { headers: githubHeaders(), redirect: 'follow' });
+  if (!res.ok || !res.body) throw new Error(`Download failed ${res.status} from ${url}`);
   mkdirSync(join(dest, '..'), { recursive: true });
   const file = createWriteStream(dest);
   await pipeline(res.body as unknown as NodeJS.ReadableStream, file);
+  const bytes = existsSync(dest) ? statSync(dest).size : 0;
+  log(`  saved ${dest} (${bytes} bytes)`);
 }
 
-export async function downloadRelease(version: string): Promise<string> {
+export async function downloadRelease(version: string, log: UpdateLogger = () => {}): Promise<string> {
   const existingReleaseDir = join(RELEASES_DIR, version);
-  if (existsSync(join(existingReleaseDir, 'manifest.json'))) return existingReleaseDir;
+  if (existsSync(join(existingReleaseDir, 'manifest.json'))) {
+    log(`release already extracted at ${existingReleaseDir}`);
+    return existingReleaseDir;
+  }
 
   const repo = defaultRepo();
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/v${version}`, {
+  const url = githubReleaseTagUrl(repo, version);
+  const res = await fetchLogged(log, url, {
     headers: githubHeaders(),
   });
-  if (!res.ok) throw new Error(`Release v${version} not found (${res.status})`);
+  if (!res.ok) throw new Error(`Release v${version} not found at ${url} (${res.status})`);
   const json = await res.json() as { assets: Array<{ name: string; browser_download_url: string }> };
   const assetName = `config365-app-${version}.tar.gz`;
   const asset = json.assets.find(a => a.name === assetName);
-  if (!asset) throw new Error(`Asset ${assetName} not found`);
+  if (!asset) throw new Error(`Asset ${assetName} not found on ${url}`);
+  log(`  using asset ${assetName} → ${asset.browser_download_url}`);
 
   const releaseDir = join(RELEASES_DIR, version);
   mkdirSync(releaseDir, { recursive: true });
   const tarPath = join(STAGING_DL, `${version}.tar.gz`);
   mkdirSync(STAGING_DL, { recursive: true });
-  await downloadFile(asset.browser_download_url, tarPath);
-  await execFileAsync('tar', ['-xzf', tarPath, '-C', releaseDir]);
+  await downloadFile(asset.browser_download_url, tarPath, log);
+  await execLogged(log, 'tar', ['-xzf', tarPath, '-C', releaseDir]);
   rmSync(tarPath, { force: true });
+  log(`extracted to ${releaseDir}`);
   return releaseDir;
 }
 
@@ -366,11 +519,17 @@ export function assertPlatformCompatible(manifest: AppReleaseManifest): void {
   }
 }
 
-export async function runMigrationsForRelease(releaseDir: string): Promise<{ schemaVersion: number; migrationsApplied: number }> {
+export async function runMigrationsForRelease(
+  releaseDir: string,
+  log: UpdateLogger = () => {},
+): Promise<{ schemaVersion: number; migrationsApplied: number }> {
   const migrator = join(releaseDir, 'run-migrations.mjs');
-  if (!existsSync(migrator)) return { schemaVersion: await getInstalledSchemaVersion(), migrationsApplied: 0 };
+  if (!existsSync(migrator)) {
+    log(`no ${migrator} — skipping schema migrations`);
+    return { schemaVersion: await getInstalledSchemaVersion(), migrationsApplied: 0 };
+  }
   ensureAppNodeModulesLink();
-  const { stdout } = await execFileAsync('node', [migrator], {
+  const { stdout } = await execLogged(log, 'node', [migrator], {
     env: { ...process.env, SESSION_SECRET: process.env.SESSION_SECRET },
   });
   const lastLine = stdout.trim().split('\n').pop() ?? '{}';
@@ -381,15 +540,17 @@ export async function runMigrationsForRelease(releaseDir: string): Promise<{ sch
   }
 }
 
-export async function swapAppRelease(version: string, releaseDir: string): Promise<void> {
+export async function swapAppRelease(version: string, releaseDir: string, log: UpdateLogger = () => {}): Promise<void> {
   const currentLink = join(DATA_APP, 'current');
   mkdirSync(DATA_APP, { recursive: true });
   ensureAppNodeModulesLink();
-  await execFileAsync('ln', ['-sfn', releaseDir, currentLink]);
+  await execLogged(log, 'ln', ['-sfn', releaseDir, currentLink]);
+  const installed = join(DATA_APP, 'installed-version.json');
   writeFileSync(
-    join(DATA_APP, 'installed-version.json'),
+    installed,
     JSON.stringify({ appVersion: version, installedAt: new Date().toISOString() }, null, 2),
   );
+  log(`wrote ${installed} appVersion=${version}`);
 }
 
 export async function restartPortalServices(): Promise<void> {
@@ -399,35 +560,41 @@ export async function restartPortalServices(): Promise<void> {
 
 export async function executeWizardStep2(session: UpdateSession): Promise<UpdateSession> {
   const version = session.targetVersion;
-  appendSessionLog(session, `Downloading release v${version}...`);
+  const log = sessionLogger(session);
+  const source = currentSourceDebug();
+  log(`will apply v${version} from ${githubReleaseTagUrl(source.repo, version)}`);
   session.step = 'step2a';
   writeUpdateSession(session);
 
-  const releaseDir = await downloadRelease(version);
+  const releaseDir = await downloadRelease(version, log);
   session.extractPath = releaseDir;
   const manifest = JSON.parse(readFileSync(join(releaseDir, 'manifest.json'), 'utf-8')) as AppReleaseManifest;
   session.manifest = manifest as unknown as Record<string, unknown>;
+  log(`manifest requiredPlatform=v${manifest.requiredPlatformVersion} schema=v${manifest.requiredSchemaVersion} type=${manifest.updateType}`);
   assertPlatformCompatible(manifest);
   verifyReleaseChecksums(releaseDir, manifest);
+  log('checksums ok');
 
-  appendSessionLog(session, 'Running schema migrations...');
-  const mig = await runMigrationsForRelease(releaseDir);
+  const mig = await runMigrationsForRelease(releaseDir, log);
   session.schemaVersion = mig.schemaVersion;
   session.migrationsApplied = mig.migrationsApplied;
-  appendSessionLog(session, `Schema v${mig.schemaVersion} (${mig.migrationsApplied} migration(s))`);
+  log(`schema now v${mig.schemaVersion} (${mig.migrationsApplied} migration(s))`);
 
   session.step = 'step2b';
   writeUpdateSession(session);
-  appendSessionLog(session, 'Swapping portal release...');
-  await swapAppRelease(version, releaseDir);
+  await swapAppRelease(version, releaseDir, log);
   session.step = 'restarting';
   writeUpdateSession(session);
-  appendSessionLog(session, 'Portal release swapped — restart pending');
+  log('portal release swapped — restart pending');
   return session;
 }
 
-export async function restartPortalServicesDetached(): Promise<void> {
-  if (!existsSync('/usr/bin/supervisorctl')) return;
+export async function restartPortalServicesDetached(log: UpdateLogger = () => {}): Promise<void> {
+  if (!existsSync('/usr/bin/supervisorctl')) {
+    log('supervisorctl not present — skip portal restart');
+    return;
+  }
+  log('$ supervisorctl restart portal token-api  (detached)');
   const { spawn } = await import('child_process');
   const child = spawn('supervisorctl', ['restart', 'portal', 'token-api'], {
     detached: true,
