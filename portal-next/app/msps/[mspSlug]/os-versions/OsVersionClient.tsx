@@ -1,7 +1,7 @@
 'use client';
 import { Fragment, useState, useEffect, useCallback } from 'react';
 import RiskBadge from '@/components/RiskBadge';
-import { deviceBelowThreshold, resolveDeviceOsVersion } from '@/lib/os-version-threshold';
+import { androidPatchFromBuild, deviceBelowThreshold, resolveDeviceOsVersion } from '@/lib/os-version-threshold';
 
 type Platform = 'android' | 'ios' | 'windows' | 'macos';
 
@@ -87,14 +87,14 @@ function complianceRowToDevice(row: {
   inMam?: boolean;
   inMde?: boolean;
 }): DefenderDevice {
-  const osVersion = resolveDeviceOsVersion({ osVersion: row.osVersion }) || row.osVersion || '';
+  const osVersion = resolveDeviceOsVersion({ osVersion: row.osVersion }) || '';
   return {
     id: row.id,
     computerDnsName: row.deviceName,
     osPlatform: row.platform,
     osVersion,
     osBuild: null,
-    patchVersion: row.patchVersion,
+    patchVersion: row.patchVersion || androidPatchFromBuild(row.osVersion) || null,
     lastSeen: row.mdeLastSeen ?? row.lastSync ?? '',
     riskScore: row.mdeRiskScore ?? '',
     healthStatus: row.mdeHealthStatus ?? '',

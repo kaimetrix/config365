@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getSession } from '@/lib/server/session';
 import { listTenants } from '@/lib/server/tenant-store';
 import { getToken, getBaseUrl, getWorkflowRuns, getWorkflowRun, type WorkflowRun } from '@/lib/server/gitea';
+import { annotateAndUnstick } from '@/lib/server/actions-unstick';
 import { requireMspAccess } from '@/lib/server/authz';
 
 export const runtime = 'nodejs';
@@ -107,13 +108,15 @@ export async function GET(request: NextRequest) {
         });
       }));
 
+      const [deploy, backup, maintenance] = await Promise.all([
+        annotateAndUnstick(org, repo, deployRuns[0] ?? null),
+        annotateAndUnstick(org, repo, backupRuns[0] ?? null),
+        annotateAndUnstick(org, repo, maintRuns[0] ?? null),
+      ]);
+
       return {
         slug:      tenant.slug,
-        runs: {
-          deploy:      deployRuns[0] ?? null,
-          backup:      backupRuns[0] ?? null,
-          maintenance: maintRuns[0]  ?? null,
-        },
+        runs: { deploy, backup, maintenance },
         approvals: liveApprovals,
       };
     }),

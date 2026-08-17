@@ -1,3 +1,17 @@
+## [1.4.0] - 2026-08-17
+
+Platform: Gitea 1.27.2 + gitea-runner 2.3.0, plus stuck Set up job recover. Also includes Intune OS version (MDM vs App Protection) from 1.3.x.
+
+### Changes
+- No commits found since last release
+
+## [1.3.1] - 2026-08-17
+
+### Changes
+- chore(docker): run Gitea 1.27.2 and recover stuck Set up job
+- fix(backup): persist Intune MAM platformVersion as the OS release
+- fix(ui): do not treat Android MDE patch dates as Windows 10.0 versions
+
 ## [1.3.0] - 2026-08-16
 
 Platform rebuild: OS version control (MDM vs App Protection impact), Windows/macOS Intune-only preview, update-source and live update logs.

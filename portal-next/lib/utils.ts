@@ -40,7 +40,11 @@ export function toGiteaWebUrl(htmlUrl: string): string {
   }
 }
 
-export function runStatusInfo(status: string | null | undefined): { cls: string; label: string; pulse: boolean } {
+export function runStatusInfo(
+  status: string | null | undefined,
+  opts?: { stuckSetup?: boolean },
+): { cls: string; label: string; pulse: boolean } {
+  if (opts?.stuckSetup) return { cls: 'badge-warning', label: 'Stuck', pulse: true };
   switch (status) {
     case 'success':   return { cls: 'badge-success', label: 'Succeeded', pulse: false };
     case 'failure':   return { cls: 'badge-failure', label: 'Failed',    pulse: false };

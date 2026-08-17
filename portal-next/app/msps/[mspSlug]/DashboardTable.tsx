@@ -11,6 +11,7 @@ interface WorkflowRun {
   display_title?: string;
   name?: string;
   html_url: string;
+  stuckSetup?: boolean;
 }
 
 interface GitCommit {
@@ -161,11 +162,15 @@ function RunBadge({ run }: { run: WorkflowRun | null }) {
   if (!run) return <span className="badge badge-neutral">Idle</span>;
   const map: Record<string, string> = { success: 'badge-success', failure: 'badge-failure', running: 'badge-running', waiting: 'badge-warning', cancelled: 'badge-neutral', skipped: 'badge-neutral', blocked: 'badge-warning' };
   const labels: Record<string, string> = { success: 'OK', failure: 'Failed', running: 'Running', waiting: 'Queued', cancelled: 'Cancelled', skipped: 'Skipped', blocked: 'Blocked' };
-  const cls   = map[run.status] ?? 'badge-neutral';
-  const label = labels[run.status] ?? run.status;
-  const active = run.status === 'running' || run.status === 'waiting';
+  const stuck = !!run.stuckSetup;
+  const cls   = stuck ? 'badge-warning' : (map[run.status] ?? 'badge-neutral');
+  const label = stuck ? 'Stuck' : (labels[run.status] ?? run.status);
+  const active = stuck || run.status === 'running' || run.status === 'waiting';
+  const title = stuck
+    ? 'Stuck in Set up job — cancelling and retrying once'
+    : (run.display_title ?? run.name ?? '');
   return (
-    <span className={`badge ${cls}${active ? ' pulse' : ''}`} title={run.display_title ?? run.name ?? ''}>
+    <span className={`badge ${cls}${active ? ' pulse' : ''}`} title={title}>
       {label}
     </span>
   );

@@ -123,7 +123,15 @@ function Format-MamRegistrationRecord {
         azureADDeviceId              = $Reg.azureADDeviceId
         deviceName                   = $Reg.deviceName
         platform                     = $platform
-        deviceOperatingSystemVersion = $Reg.deviceOperatingSystemVersion
+        # Graph leaves deviceOperatingSystemVersion null on Android/iOS MAM.
+        # platformVersion is the OS release the app-protection client reports (e.g. "16", "26.6").
+        deviceOperatingSystemVersion = if ($Reg.deviceOperatingSystemVersion) {
+            [string]$Reg.deviceOperatingSystemVersion
+        } elseif ($Reg.platformVersion) {
+            [string]$Reg.platformVersion
+        } else {
+            $null
+        }
         patchVersion                 = if ($Reg.patchVersion) { $Reg.patchVersion } else { $null }
         userId                       = $Reg.userId
         createdDateTime              = $Reg.createdDateTime

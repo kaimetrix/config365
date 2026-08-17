@@ -3,7 +3,7 @@
  * into a unified device compliance row list.
  */
 
-import { resolveDeviceOsVersion } from './os-version-threshold';
+import { androidPatchFromBuild, normalizeOsVersion, resolveDeviceOsVersion } from './os-version-threshold';
 
 export interface ManagedDeviceRecord {
   id: string;
@@ -109,7 +109,14 @@ export function normalizeDeviceName(name: string | null | undefined): string {
 }
 
 function mdeOsVersion(mde: MdeDeviceRecord): string | null {
-  return resolveDeviceOsVersion(mde) || mde.osVersion || null;
+  return resolveDeviceOsVersion(mde) || null;
+}
+
+function mdePatchVersion(mde: MdeDeviceRecord): string | null {
+  return mde.patchVersion
+    || androidPatchFromBuild(mde.osBuild)
+    || androidPatchFromBuild(mde.osVersion)
+    || null;
 }
 
 function buildManagementType(flags: { mdm: boolean; mam: boolean; mde: boolean }): string {
@@ -132,8 +139,10 @@ function applyMdeEnrichment(row: DeviceComplianceRow, mde: MdeDeviceRecord): Dev
     ...row,
     deviceName: row.deviceName || mde.computerDnsName || mde.id,
     platform: row.platform !== 'other' ? row.platform : normalizePlatform(mde.osPlatform),
-    osVersion: row.osVersion ?? mdeOsVersion(mde),
-    patchVersion: row.patchVersion ?? mde.patchVersion ?? null,
+    // Version stays Intune-only (MDM osVersion or MAM platformVersion).
+    // MDE release can disagree with App Protection and is not what the policies evaluate.
+    osVersion: normalizeOsVersion(row.osVersion) || null,
+    patchVersion: row.patchVersion ?? mdePatchVersion(mde),
     mdeRiskScore: mde.riskScore ?? null,
     mdeExposureLevel: mde.exposureLevel ?? null,
     mdeHealthStatus: mde.healthStatus ?? null,
@@ -206,8 +215,7 @@ export function mergeDeviceComplianceData(
       deviceName: md.deviceName ?? 'Unknown',
       platform: normalizePlatform(md.operatingSystem),
       osVersion: resolveDeviceOsVersion({ osVersion: md.osVersion })
-        || md.osVersion
-        || mamReg?.deviceOperatingSystemVersion
+        || normalizeOsVersion(mamReg?.deviceOperatingSystemVersion)
         || null,
       patchVersion: mamReg?.patchVersion ?? null,
       managementType: buildManagementType({ mdm: true, mam: !!mamReg, mde: !!mdeMatch }),
@@ -246,7 +254,7 @@ export function mergeDeviceComplianceData(
       id: aadKey || reg.deviceName || `mam-${rowsByKey.size}`,
       deviceName: reg.deviceName ?? 'Unknown',
       platform: normalizePlatform(reg.platform ?? reg.deviceOperatingSystemVersion),
-      osVersion: reg.deviceOperatingSystemVersion ?? null,
+      osVersion: normalizeOsVersion(reg.deviceOperatingSystemVersion) || null,
       patchVersion: reg.patchVersion ?? null,
       managementType: buildManagementType({ mdm: false, mam: true, mde: !!mdeDevice }),
       complianceState: null,
@@ -294,7 +302,7 @@ export function mergeDeviceComplianceData(
       deviceName: mdeDevice.computerDnsName ?? mdeDevice.id,
       platform: normalizePlatform(mdeDevice.osPlatform),
       osVersion: mdeOsVersion(mdeDevice),
-      patchVersion: mdeDevice.patchVersion ?? null,
+      patchVersion: mdePatchVersion(mdeDevice),
       managementType: 'MDE',
       complianceState: 'notInIntune',
       complianceGracePeriodExpirationDateTime: null,

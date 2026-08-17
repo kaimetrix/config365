@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  androidPatchFromBuild,
   compareVersions,
   deviceBelowThreshold,
   normalizeOsVersion,
@@ -29,6 +30,18 @@ describe('normalizeOsVersion', () => {
   it('keeps iOS and Android dotted versions', () => {
     assert.equal(normalizeOsVersion('18.5'), '18.5');
     assert.equal(normalizeOsVersion('15.0'), '15.0');
+    assert.equal(normalizeOsVersion('16'), '16');
+  });
+
+  it('does not treat Android patch dates as Windows builds', () => {
+    assert.equal(normalizeOsVersion('20260705'), '');
+    assert.equal(normalizeOsVersion('10.0.20260705'), '');
+    assert.equal(normalizeOsVersion('10.0.20260505'), '');
+  });
+
+  it('reads Android release from MDE detail strings', () => {
+    assert.equal(normalizeOsVersion('Android (Release 16.0 Build 20260705)'), '16.0');
+    assert.equal(normalizeOsVersion('Release 16.0'), '16.0');
   });
 
   it('strips macOS Darwin build suffixes', () => {
@@ -48,6 +61,11 @@ describe('resolveDeviceOsVersion', () => {
     assert.equal(resolveDeviceOsVersion({ osVersion: '22H2', osBuild: 22631 }), '10.0.22631');
     assert.equal(resolveDeviceOsVersion({ osVersion: null, osBuild: null }), '');
   });
+
+  it('does not use Android patch-date builds as the OS version', () => {
+    assert.equal(resolveDeviceOsVersion({ osVersion: '10.0.20260705', osBuild: '20260705' }), '');
+    assert.equal(resolveDeviceOsVersion({ osVersion: '', osBuild: '20260505' }), '');
+  });
 });
 
 describe('deviceBelowThreshold', () => {
@@ -64,6 +82,14 @@ describe('deviceBelowThreshold', () => {
   it('treats macOS versions with build suffixes as comparable', () => {
     assert.equal(deviceBelowThreshold({ osVersion: '26.6.1 (25G76)' }, '26.6.1'), false);
     assert.equal(deviceBelowThreshold({ osVersion: '15.3.1 (24D70)' }, '26.6.1'), true);
+  });
+});
+
+describe('androidPatchFromBuild', () => {
+  it('formats MDE Android YYYYMMDD builds as ISO patch dates', () => {
+    assert.equal(androidPatchFromBuild('20260705'), '2026-07-05');
+    assert.equal(androidPatchFromBuild('10.0.20260505'), '2026-05-05');
+    assert.equal(androidPatchFromBuild('22631'), '');
   });
 });
 

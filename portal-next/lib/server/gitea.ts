@@ -75,6 +75,8 @@ export interface WorkflowRun {
   display_title?: string;
   /** The workflow filename extracted from the Gitea "path" field (e.g. "deploy.yml") */
   workflow_path?: string;
+  /** Runner claimed the job but never left the implicit Set up job step. */
+  stuckSetup?: boolean;
 }
 
 /** Gitea's raw API uses different status/conclusion values — normalise them. */
@@ -599,6 +601,10 @@ export async function getWorkflowRun(owner: string, repo: string, runId: number)
   return normalizeRun(raw);
 }
 
+export async function getWorkflowRunRaw(owner: string, repo: string, runId: number): Promise<Record<string, unknown>> {
+  return giteaFetch<Record<string, unknown>>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}`);
+}
+
 export async function triggerWorkflow(owner: string, repo: string, workflowFile: string, ref = 'main', inputs: Record<string, string> = {}): Promise<void> {
   await giteaFetch<void>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/${encodeURIComponent(workflowFile)}/dispatches`, {
     method: 'POST', body: JSON.stringify({ ref, inputs }),
@@ -607,6 +613,18 @@ export async function triggerWorkflow(owner: string, repo: string, workflowFile:
 
 export async function cancelWorkflowRun(owner: string, repo: string, runId: number): Promise<void> {
   await giteaFetch<void>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/cancel`, { method: 'POST' });
+}
+
+/** Official rerun API is newer than Gitea 1.26.1 — returns false on 404/405. */
+export async function rerunWorkflowRun(owner: string, repo: string, runId: number): Promise<boolean> {
+  try {
+    await giteaFetch<void>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/rerun`, { method: 'POST' });
+    return true;
+  } catch (err) {
+    const msg = (err as Error).message ?? '';
+    if (/\b40[45]\b/.test(msg)) return false;
+    throw err;
+  }
 }
 
 export async function getRunLogs(owner: string, repo: string, runId: number): Promise<string> {

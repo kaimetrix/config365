@@ -360,28 +360,48 @@ function Format-DeviceRecord {
         $MamPatchMap = $null   # optional MAM patch map from Get-MamPatchMap
     )
 
-    # Prefer a dotted numeric version. MDE Windows devices often have osVersion
-    # empty (or a label like "22H2") and the real build in osBuild (e.g. 22631).
+    # MDE machines API:
+    #   version  = OS release ("16.0", "22H2")
+    #   osBuild  = Android/iOS security-patch date (20260505) or Windows build (22631)
+    # Do not use $isWindows — that overwrites PowerShell's automatic $IsWindows.
+    $platformKey  = Get-PlatformKey -OsPlatform ([string]$Device.osPlatform)
     $graphVersion = if ($GraphInfo) { [string]$GraphInfo.operatingSystemVersion } else { $null }
+    $mdeRelease   = if ($null -ne $Device.version) { [string]$Device.version } else { $null }
     $mdeVersion   = if ($null -ne $Device.osVersion) { [string]$Device.osVersion } else { $null }
     $osBuildRaw   = if ($null -ne $Device.osBuild) { [string]$Device.osBuild } else { $null }
-    $buildAsNt    = if ($osBuildRaw -match '^\d{5,}') { "10.0.$osBuildRaw" } else { $osBuildRaw }
+    $isWinPlat    = $platformKey -eq 'windows'
+    $buildAsNt    = if ($isWinPlat -and $osBuildRaw -match '^\d{5,}') { "10.0.$osBuildRaw" } else { $null }
 
     $resolvedOsVersion = $null
-    foreach ($candidate in @($graphVersion, $mdeVersion, $buildAsNt)) {
-        if ($candidate -and ($candidate -match '^\d+(\.\d+)+$')) {
+    # Mobile: MDE version is the OS release. Graph/Entra often has the patch date
+    # mis-filed as 10.0.YYYYMMDD — skip those. Windows: Graph, then MDE, then NT build.
+    $candidates = if ($platformKey -in @('android', 'ios')) {
+        @($mdeRelease, $mdeVersion, $graphVersion)
+    } else {
+        @($graphVersion, $mdeRelease, $mdeVersion, $buildAsNt)
+    }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) { continue }
+        if ($candidate -match '^(10\.0\.)?20\d{6}$') { continue }
+        # Sense / Defender mobile client (e.g. 1.0.9129.0101), not the OS release.
+        if ($candidate -match '^1\.0\.\d{4}') { continue }
+        if ($candidate -match 'Release\s+(\d+(?:\.\d+)*)') {
+            $resolvedOsVersion = $Matches[1]
+            break
+        }
+        if ($candidate -match '^\d+(\.\d+)*$') {
             $resolvedOsVersion = $candidate
             break
         }
     }
-    if (-not $resolvedOsVersion) { $resolvedOsVersion = $mdeVersion }
 
-    # Resolve Android security patch level from MAM registration (ISO date string, e.g. "2026-04-05").
-    # Matched by azureADDeviceId because MDE computerDnsName ("lale_Android") differs from MAM deviceName ("Samsung SM-F741B").
-    $patchVersion = if ($MamPatchMap -and $Device.aadDeviceId -and $MamPatchMap.ContainsKey($Device.aadDeviceId)) {
-        $MamPatchMap[$Device.aadDeviceId]
-    } else {
-        $null
+    # Patch: MDE osBuild when it is YYYYMMDD (Android/iOS security patch).
+    # MAM patch is fallback only — it can lag the MDE build date.
+    $patchVersion = $null
+    if ($osBuildRaw -match '^(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$') {
+        $patchVersion = "$($Matches[1])-$($Matches[2])-$($Matches[3])"
+    } elseif ($MamPatchMap -and $Device.aadDeviceId -and $MamPatchMap.ContainsKey($Device.aadDeviceId)) {
+        $patchVersion = $MamPatchMap[$Device.aadDeviceId]
     }
 
     return @{
@@ -522,9 +542,9 @@ try {
             } else { @() }
             if ($DebugMode) { Write-Log "  logon users retrieved ($($logonUsers.Count) entries); enriching if applicable..." 'DEBUG' }
 
-            # Enrich via Graph. MDE osVersion is null for Android/iOS/macOS and
-            # often empty for Windows (build lives in osBuild). Entra's
-            # operatingSystemVersion is the dotted value Intune compliance uses.
+            # Enrich via Graph. MDE osVersion is null for Android/iOS/macOS;
+            # the release is in `version` (e.g. 16.0). Windows build lives in osBuild.
+            # Entra operatingSystemVersion is the dotted value Intune compliance uses.
             $graphInfo = $null
             if ($platformKey -in @('android', 'ios', 'macos', 'windows') -and $device.aadDeviceId -and $graphToken) {
                 $graphInfo = Get-DeviceGraphInfo -AadDeviceId $device.aadDeviceId -GraphToken $graphToken

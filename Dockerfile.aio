@@ -130,9 +130,8 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     && /usr/bin/node --version && /usr/bin/npm --version
 
 # ── Gitea binary ──────────────────────────────────────────────────────────────
-# TEMP (dev perf): pin 1.26.1 to match wiped_dev volume after June-18 rollback.
-# Restore GITEA_VERSION=1.27.0 (+ RUNNER_VERSION=2.1.0) when perf work is done.
-ARG GITEA_VERSION=1.26.1
+# 1.27.2: FetchTask claim-timeout fix (#38343) + later Actions/cancel patches.
+ARG GITEA_VERSION=1.27.2
 RUN wget -qO /usr/local/bin/gitea \
       "https://dl.gitea.com/gitea/${GITEA_VERSION}/gitea-${GITEA_VERSION}-linux-amd64" \
     && chmod +x /usr/local/bin/gitea \
@@ -142,8 +141,8 @@ RUN wget -qO /usr/local/bin/gitea \
 # Project was renamed from act_runner → gitea-runner at v1.0.0.
 # Binary is saved to the legacy path so runner-start.sh and entrypoint-aio.sh
 # require no changes.
-# TEMP: 1.0.3 pairs with Gitea 1.26.1 (see GITEA_VERSION note above).
-ARG RUNNER_VERSION=1.0.3
+# 2.3.0 is the latest 2.x and the recommended pair for Gitea 1.27.
+ARG RUNNER_VERSION=2.3.0
 RUN wget -qO /usr/local/bin/act_runner \
       "https://dl.gitea.com/gitea-runner/${RUNNER_VERSION}/gitea-runner-${RUNNER_VERSION}-linux-amd64" \
     && chmod +x /usr/local/bin/act_runner \
