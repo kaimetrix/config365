@@ -1,3 +1,24 @@
+## [1.5.0] - 2026-08-22
+
+Platform 1.5.0: AppLocker editor and WhatIf XML diffs, overlay merge/compare, deploy approval hardening, group-skip logging, enterprise-ready README, compliance and Policy Viewer updates.
+
+### Changes
+- docs: cover enterprise env tenants and fix WhatIf/group-skip visibility
+- fix(ui): show AppLocker WhatIf diffs as individual XML rules
+- fix(deploy): treat matching AppLocker overlays as no-change and require a real approval
+- feat(ui): edit tenant .baseline-ignore and load Policy Viewer trees on the client
+- feat(ui): show tenant .baseline-ignore in Policy Viewer
+- fix(ui): confirm AppLocker deletes and drop the row in place
+- fix(update): default app updates and fork deploys to GA
+- docs: default README deploy examples to the GA image
+- fix(ui): restyle AppLocker tenant-rules toggle
+- feat(ui): show tenant AppLocker rules in the baseline view
+- fix(ui): combine AppLocker rule lists and copy tenant rules to baseline
+- fix(ui): read tenant AppLocker backups and show run stage progress
+- feat(ui): add AppLocker editor with tenant backup import
+- feat(ui): add compliance selection, group filters, and device membership backup
+- fix(ui): drop stale user-compliance fetches and Gitea stuck-job retry
+
 ## [1.4.0] - 2026-08-17
 
 Platform: Gitea 1.27.2 + gitea-runner 2.3.0, plus stuck Set up job recover. Also includes Intune OS version (MDM vs App Protection) from 1.3.x.

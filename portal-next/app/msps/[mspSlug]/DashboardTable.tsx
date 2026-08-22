@@ -11,7 +11,7 @@ interface WorkflowRun {
   display_title?: string;
   name?: string;
   html_url: string;
-  stuckSetup?: boolean;
+  progress?: { completed: number; total: number; current?: string };
 }
 
 interface GitCommit {
@@ -162,16 +162,16 @@ function RunBadge({ run }: { run: WorkflowRun | null }) {
   if (!run) return <span className="badge badge-neutral">Idle</span>;
   const map: Record<string, string> = { success: 'badge-success', failure: 'badge-failure', running: 'badge-running', waiting: 'badge-warning', cancelled: 'badge-neutral', skipped: 'badge-neutral', blocked: 'badge-warning' };
   const labels: Record<string, string> = { success: 'OK', failure: 'Failed', running: 'Running', waiting: 'Queued', cancelled: 'Cancelled', skipped: 'Skipped', blocked: 'Blocked' };
-  const stuck = !!run.stuckSetup;
-  const cls   = stuck ? 'badge-warning' : (map[run.status] ?? 'badge-neutral');
-  const label = stuck ? 'Stuck' : (labels[run.status] ?? run.status);
-  const active = stuck || run.status === 'running' || run.status === 'waiting';
-  const title = stuck
-    ? 'Stuck in Set up job — cancelling and retrying once'
-    : (run.display_title ?? run.name ?? '');
+  const cls   = map[run.status] ?? 'badge-neutral';
+  const label = labels[run.status] ?? run.status;
+  const active = run.status === 'running' || run.status === 'waiting';
+  const count = run.progress && run.progress.total > 0
+    ? ` ${run.progress.completed}/${run.progress.total}`
+    : '';
+  const title = run.progress?.current ?? run.display_title ?? run.name ?? '';
   return (
     <span className={`badge ${cls}${active ? ' pulse' : ''}`} title={title}>
-      {label}
+      {label}{count}
     </span>
   );
 }
@@ -278,9 +278,16 @@ export default function DashboardTable({ rows, mspSlug, mspOrg, mspId }: Props) 
     }, 1000);
   }, [loadStatus]);
 
+  const hasActiveRun = useMemo(() => {
+    const src = Object.keys(liveRuns).length > 0 ? Object.values(liveRuns) : rows;
+    return src.some(r =>
+      [r.deploy, r.backup, r.maintenance].some(w => w?.status === 'running' || w?.status === 'waiting')
+    );
+  }, [liveRuns, rows]);
+
   useEffect(() => {
     loadStatus();
-    const id = setInterval(loadStatus, 30_000);
+    const id = setInterval(loadStatus, hasActiveRun ? 5_000 : 30_000);
     window.addEventListener('dashboard-refresh', loadStatus);
     window.addEventListener('dashboard-burst-refresh', startBurstPolling);
     return () => {
@@ -292,7 +299,7 @@ export default function DashboardTable({ rows, mspSlug, mspOrg, mspId }: Props) 
       window.removeEventListener('dashboard-refresh', loadStatus);
       window.removeEventListener('dashboard-burst-refresh', startBurstPolling);
     };
-  }, [loadStatus, startBurstPolling]);
+  }, [loadStatus, startBurstPolling, hasActiveRun]);
 
   const dismissApproval = useCallback((tenantSlug: string, issueNumber: number) => {
     setDismissed(prev => new Set([...prev, approvalKey(tenantSlug, issueNumber)]));

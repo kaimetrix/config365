@@ -9,8 +9,16 @@ import {
   githubReleasesLatestUrl,
   inferRequiredPlatformVersion,
   parseSemverParts,
+  defaultUpdateChannel,
   repoForChannel,
 } from './update-source.ts';
+
+describe('defaultUpdateChannel', () => {
+  it('defaults to GA', () => {
+    assert.equal(defaultUpdateChannel(), 'ga');
+    assert.equal(repoForChannel(defaultUpdateChannel()), 'potsolutions/config365');
+  });
+});
 
 describe('repoForChannel', () => {
   it('maps preview and ga to public GitHub repos', () => {

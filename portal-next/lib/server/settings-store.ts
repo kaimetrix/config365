@@ -166,27 +166,6 @@ export function isRejectedRun(runId: number): boolean {
   return getSetting(`rejected_run:${runId}`) === '1';
 }
 
-// ─── Stuck "Set up job" unstick tracking ──────────────────────────────────────
-
-export function wasUnstickAttempted(runId: number): boolean {
-  return getSetting(`unstick_run:${runId}`) === '1';
-}
-
-export function recordUnstickAttempt(runId: number): void {
-  setSetting(`unstick_run:${runId}`, '1');
-}
-
-export function lastWorkflowUnstickAt(org: string, repo: string, workflow: string): number | null {
-  const raw = getSetting(`unstick_wf:${org}:${repo}:${workflow}`);
-  if (!raw) return null;
-  const ms = Date.parse(raw);
-  return Number.isFinite(ms) ? ms : null;
-}
-
-export function recordWorkflowUnstick(org: string, repo: string, workflow: string, at = new Date()): void {
-  setSetting(`unstick_wf:${org}:${repo}:${workflow}`, at.toISOString());
-}
-
 /**
  * Loads the Gitea portal token from /init-data/portal-token.txt into platform_settings.
  * @param force When true, overwrite any existing DB token with the file contents.

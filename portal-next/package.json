@@ -1,6 +1,6 @@
 {
   "name": "config365-portal",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "license": "MIT",
   "scripts": {
@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "check": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test lib/mailbox-audit-drift.test.ts lib/zip-import.test.ts lib/setup-post-guard.test.ts lib/monitor-config.test.ts lib/update-source.test.ts lib/os-version-threshold.test.ts lib/actions-stuck-setup.test.ts"
+    "test": "node --experimental-strip-types --test lib/mailbox-audit-drift.test.ts lib/zip-import.test.ts lib/setup-post-guard.test.ts lib/monitor-config.test.ts lib/update-source.test.ts lib/os-version-threshold.test.ts lib/applocker.test.ts lib/applocker-fileinfo.test.ts lib/workflow-progress.test.ts"
   },
   "dependencies": {
     "@azure/identity": "^4.5.0",

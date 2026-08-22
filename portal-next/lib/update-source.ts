@@ -14,6 +14,10 @@ export interface UpdateSourceDebug {
   error?: string;
 }
 
+export function defaultUpdateChannel(): UpdateChannel {
+  return 'ga';
+}
+
 export function repoForChannel(channel: UpdateChannel): string {
   return channel === 'ga' ? 'potsolutions/config365' : 'potsolutions/config365-preview';
 }

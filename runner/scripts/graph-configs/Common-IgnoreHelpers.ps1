@@ -540,8 +540,17 @@ function Test-ResourceProtected {
         return $false 
     }
     
-    # Check if description contains the marker
-    return $Description.Contains($options.protectionMarker)
+    $markers = @(
+        $options.protectionMarker,
+        'CONFIG365:IGNORE',
+        'OM365DO:IGNORE'
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+    $desc = $Description.ToUpperInvariant()
+    foreach ($marker in $markers) {
+        if ($desc.Contains(([string]$marker).ToUpperInvariant())) { return $true }
+    }
+    return $false
 }
 
 function Get-GroupExcludedFiles {
@@ -628,28 +637,47 @@ function Get-GroupExcludedFiles {
         return $Files
     }
 
-    Write-Verbose "Get-GroupExcludedFiles: Applying exclusions — $($excFolders.Count) folder(s), $($excPatterns.Count) pattern(s), $($excFiles.Count) direct file(s)"
+    $nonMemberGroups = @($groupsConfig.PSObject.Properties.Name | Where-Object { $tenantGroups -notcontains $_ })
+    Write-Host "Get-GroupExcludedFiles: tenant groups [$($tenantGroups -join ', ')] — excluding content owned only by [$($nonMemberGroups -join ', ')]"
 
     $baselineContentNorm = $baselineContent.Replace('\', '/') + '/'
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $skipped = [System.Collections.Generic.List[string]]::new()
 
-    return $Files | Where-Object {
-        $full = $_.FullName.Replace('\', '/')
+    foreach ($file in @($Files)) {
+        $full = $file.FullName.Replace('\', '/')
         $rel  = $full.Replace($baselineContentNorm, '')
+        $drop = $false
 
         foreach ($f in $excFolders) {
-            if ($full.StartsWith($f + '/') -or $full -eq $f) { return $false }
+            if ($full.StartsWith($f + '/') -or $full -eq $f) { $drop = $true; break }
         }
-        foreach ($p in $excPatterns) {
-            # Pattern without a slash matches against filename only (same as .gitignore)
-            if ($p -notlike '*/*') {
-                if ($_.Name -like $p) { return $false }
-            } else {
-                if ($rel -like $p) { return $false }
+        if (-not $drop) {
+            foreach ($p in $excPatterns) {
+                if ($p -notlike '*/*') {
+                    if ($file.Name -like $p) { $drop = $true; break }
+                } else {
+                    if ($rel -like $p) { $drop = $true; break }
+                }
             }
         }
-        if ($excFiles -contains $full) { return $false }
-        return $true
+        if (-not $drop -and $excFiles -contains $full) { $drop = $true }
+
+        if ($drop) {
+            $skipped.Add($(if ($rel) { $rel } else { $file.Name }))
+        } else {
+            $kept.Add($file)
+        }
     }
+
+    if ($skipped.Count -gt 0) {
+        Write-Host "  Skipped $($skipped.Count) baseline file(s) (tenant is not in the owning config group):"
+        foreach ($name in $skipped) {
+            Write-Host "    - $name"
+        }
+    }
+
+    return @($kept)
 }
 
 # Note: This file is meant to be dot-sourced (. $path), not imported as a module.

@@ -9,7 +9,7 @@ STAGING="$DATA_APP/staging"
 CURRENT_LINK="$DATA_APP/current"
 INSTALLED_VERSION="$DATA_APP/installed-version.json"
 INSTALLED_PLATFORM="/data/init-data/installed-platform.json"
-UPDATE_REPO="${CONFIG365_UPDATE_REPO:-potsolutions/config365-preview}"
+UPDATE_REPO="${CONFIG365_UPDATE_REPO:-potsolutions/config365}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-${CONFIG365_GITHUB_TOKEN:-}}"
 
 log() { echo "[app-update] $*"; }

@@ -1,6 +1,6 @@
 import { requireMspContext } from '@/lib/server/page-utils';
 import { listTenants } from '@/lib/server/tenant-store';
-import { getWorkflowRuns, getCommits, getFile, tenantRepo } from '@/lib/server/gitea';
+import { getWorkflowRuns, getCommits, getFile, tenantRepo, withWorkflowProgress } from '@/lib/server/gitea';
 import type { WorkflowRun, GitCommit } from '@/lib/server/gitea';
 import AppShell from '@/components/layout/AppShell';
 import DashboardClient from './DashboardClient';
@@ -39,9 +39,11 @@ export default async function MspDashboard({ params }: { params: Promise<{ mspSl
           getCommits(org, repo, { limit: 1 }),
           getFile(org, repo, 'backups/secure-score/score.json').catch(() => ({ exists: false, content: '' })),
         ]);
-        const deploy      = deployRuns[0]  ?? null;
-        const backup      = backupRuns[0]  ?? null;
-        const maintenance = maintRuns[0]   ?? null;
+        const [deploy, backup, maintenance] = await Promise.all([
+          withWorkflowProgress(org, repo, deployRuns[0] ?? null),
+          withWorkflowProgress(org, repo, backupRuns[0] ?? null),
+          withWorkflowProgress(org, repo, maintRuns[0] ?? null),
+        ]);
         const latestCommit = commits[0]    ?? null;
         const lastActivity =
           latestCommit?.commit.author.date ||

@@ -3,6 +3,7 @@ import { writeFileSync } from 'fs';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { getSetting, setSetting, bootstrapGiteaToken, isRejectedRun } from './tenant-store';
+import { summarizeRunProgress, type WorkflowJob } from '../workflow-progress';
 
 const execFileAsync = promisify(execFile);
 
@@ -75,8 +76,8 @@ export interface WorkflowRun {
   display_title?: string;
   /** The workflow filename extracted from the Gitea "path" field (e.g. "deploy.yml") */
   workflow_path?: string;
-  /** Runner claimed the job but never left the implicit Set up job step. */
-  stuckSetup?: boolean;
+  /** Completed / total stages for an active run (module steps, else jobs). */
+  progress?: { completed: number; total: number; current?: string };
 }
 
 /** Gitea's raw API uses different status/conclusion values — normalise them. */
@@ -163,16 +164,6 @@ export interface TreeEntry {
   type: 'file' | 'dir';
   size: number;
   sha: string;
-}
-
-export interface WorkflowJob {
-  id: number;
-  name: string;
-  status: string;
-  conclusion: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  steps: Array<{ name: string; status: string; conclusion: string | null; number: number }>;
 }
 
 export interface GiteaOrg {
@@ -559,17 +550,51 @@ async function listGitTreeBlobs(
   return blobs;
 }
 
+const GIT_TREE_CACHE_MAX = 48;
+const gitTreeCache = new Map<string, GitTreeEntry[]>();
+const gitTreeInflight = new Map<string, Promise<GitTreeEntry[]>>();
+
+function rememberGitTree(key: string, entries: GitTreeEntry[]) {
+  if (gitTreeCache.size >= GIT_TREE_CACHE_MAX) {
+    const oldest = gitTreeCache.keys().next().value;
+    if (oldest) gitTreeCache.delete(oldest);
+  }
+  gitTreeCache.set(key, entries);
+}
+
+async function loadGitTreeBlobs(owner: string, repo: string, commitSha: string): Promise<GitTreeEntry[]> {
+  const tree = await giteaFetch<{ tree: GitTreeEntry[]; truncated: boolean }>(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${commitSha}?recursive=1`,
+  );
+  if (!tree.truncated) {
+    return (tree.tree ?? []).filter(e => e.type === 'blob');
+  }
+
+  // Gitea caps recursive trees at 1000 entries — walk each subtree instead.
+  return listGitTreeBlobs(owner, repo, commitSha);
+}
+
 export async function getGitTree(owner: string, repo: string, ref = 'main'): Promise<GitTreeEntry[]> {
   try {
     const branch = await giteaFetch<{ commit: { id: string } }>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches/${encodeURIComponent(ref)}`);
     const commitSha = branch.commit.id;
-    const tree = await giteaFetch<{ tree: GitTreeEntry[]; truncated: boolean }>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${commitSha}?recursive=1`);
-    if (!tree.truncated) {
-      return (tree.tree ?? []).filter(e => e.type === 'blob');
-    }
+    const cacheKey = `${owner}/${repo}@${commitSha}`;
+    const cached = gitTreeCache.get(cacheKey);
+    if (cached) return cached;
 
-    // Gitea caps recursive trees at 1000 entries — walk each subtree instead.
-    return listGitTreeBlobs(owner, repo, commitSha);
+    const inflight = gitTreeInflight.get(cacheKey);
+    if (inflight) return inflight;
+
+    const pending = loadGitTreeBlobs(owner, repo, commitSha)
+      .then(entries => {
+        rememberGitTree(cacheKey, entries);
+        return entries;
+      })
+      .finally(() => {
+        gitTreeInflight.delete(cacheKey);
+      });
+    gitTreeInflight.set(cacheKey, pending);
+    return pending;
   } catch (err: unknown) {
     if ((err as Error)?.message?.includes('404')) return [];
     throw err;
@@ -601,8 +626,28 @@ export async function getWorkflowRun(owner: string, repo: string, runId: number)
   return normalizeRun(raw);
 }
 
-export async function getWorkflowRunRaw(owner: string, repo: string, runId: number): Promise<Record<string, unknown>> {
-  return giteaFetch<Record<string, unknown>>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}`);
+export async function getWorkflowJobs(owner: string, repo: string, runId: number): Promise<WorkflowJob[]> {
+  const data = await giteaFetch<{ jobs?: WorkflowJob[] }>(
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/jobs`,
+  );
+  return data.jobs ?? [];
+}
+
+/** Attach stage progress for an active run. Idle/finished runs are returned unchanged. */
+export async function withWorkflowProgress(
+  owner: string,
+  repo: string,
+  run: WorkflowRun | null,
+): Promise<WorkflowRun | null> {
+  if (!run) return null;
+  if (run.status !== 'running' && run.status !== 'waiting' && run.status !== 'blocked') return run;
+  try {
+    const jobs = await getWorkflowJobs(owner, repo, run.id);
+    const progress = summarizeRunProgress(jobs);
+    return progress ? { ...run, progress } : run;
+  } catch {
+    return run;
+  }
 }
 
 export async function triggerWorkflow(owner: string, repo: string, workflowFile: string, ref = 'main', inputs: Record<string, string> = {}): Promise<void> {
@@ -613,18 +658,6 @@ export async function triggerWorkflow(owner: string, repo: string, workflowFile:
 
 export async function cancelWorkflowRun(owner: string, repo: string, runId: number): Promise<void> {
   await giteaFetch<void>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/cancel`, { method: 'POST' });
-}
-
-/** Official rerun API is newer than Gitea 1.26.1 — returns false on 404/405. */
-export async function rerunWorkflowRun(owner: string, repo: string, runId: number): Promise<boolean> {
-  try {
-    await giteaFetch<void>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/rerun`, { method: 'POST' });
-    return true;
-  } catch (err) {
-    const msg = (err as Error).message ?? '';
-    if (/\b40[45]\b/.test(msg)) return false;
-    throw err;
-  }
 }
 
 export async function getRunLogs(owner: string, repo: string, runId: number): Promise<string> {
@@ -640,13 +673,6 @@ export async function downloadArtifact(artifactDownloadUrl: string): Promise<Buf
   const res = await fetch(artifactDownloadUrl, { headers: { Authorization: `token ${getToken()}` } });
   if (!res.ok) throw new Error(`Artifact download failed: ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
-}
-
-export async function getRunJobs(owner: string, repo: string, runId: number): Promise<WorkflowJob[]> {
-  try {
-    const data = await giteaFetch<{ jobs: WorkflowJob[] }>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/jobs`);
-    return data.jobs ?? [];
-  } catch { return []; }
 }
 
 // ─── Secrets ──────────────────────────────────────────────────────────────────

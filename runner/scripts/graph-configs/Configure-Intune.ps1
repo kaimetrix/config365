@@ -115,6 +115,13 @@ $baselineRoot = if ($TenantBaselinePath) { Join-Path $TenantBaselinePath "baseli
 $policyFiles = @(Get-FilteredPolicyFiles -PolicyFiles $policyFiles -BaselineRoot $baselineRoot)
 $policyFiles = @(Get-GroupExcludedFiles -Files $policyFiles -TenantBaselinePath $TenantBaselinePath -TenantRepoPath $TenantRepoPath)
 
+# Tenant AppLocker additions/exclusions — mutate working-copy XML before load/compare
+$applockerMergePath = Join-Path $scriptRoot "Merge-AppLockerOverlays.ps1"
+if (Test-Path -LiteralPath $applockerMergePath) {
+    . $applockerMergePath
+    Merge-AppLockerOverlays -PolicyFiles $policyFiles -TenantRepoPath $TenantRepoPath
+}
+
 if ($policyFiles.Count -eq 0) {
     Write-Host "##[warning]No JSON files found in directory: $ConfigDirectory"
     exit 0

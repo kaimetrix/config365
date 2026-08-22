@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback, useMemo, Fragment } from 'react';
+import { useState, useEffect, useCallback, useMemo, Fragment, useRef } from 'react';
 import { matchIpToNamedLocations, type NamedLocationRecord } from '@/lib/named-location-match';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -139,16 +139,25 @@ function isMobileEntry(e: SignInEntry) {
   return MOBILE_OS.some(m => os.includes(m));
 }
 
+function entrySkipReason(e: SignInEntry, crit: ComplianceCriteria): string | null {
+  const excluded = new Set(crit.excludedApps);
+  if (excluded.size > 0 && e.appsAccessed.length > 0 && e.appsAccessed.every(a => excluded.has(a))) {
+    return e.appsAccessed.length === 1
+      ? `Excluded: ${e.appsAccessed[0]} is skipped during compliance evaluation`
+      : 'Excluded: all accessed apps are skipped during compliance evaluation';
+  }
+  if (crit.excludeMobile && isMobileEntry(e)) {
+    if (!crit.includeManagedMobile || !e.isManaged) {
+      return 'Excluded: mobile sign-ins are skipped during compliance evaluation';
+    }
+  }
+  return null;
+}
+
 function computeIsFullyCompliant(user: UserSummary, crit: ComplianceCriteria): boolean {
   if (user.entries.length === 0) return false;
-  const excluded = new Set(crit.excludedApps);
   for (const e of user.entries) {
-    // Skip entries where every accessed app is excluded
-    if (excluded.size > 0 && e.appsAccessed.length > 0 && e.appsAccessed.every(a => excluded.has(a))) continue;
-    // Skip mobile entries (optionally keep Intune-managed mobile)
-    if (crit.excludeMobile && isMobileEntry(e)) {
-      if (!crit.includeManagedMobile || !e.isManaged) continue;
-    }
+    if (entrySkipReason(e, crit)) continue;
     if (crit.requireEntraJoined && !isEntraJoined(e.trustType)) return false;
     if (crit.requireCompliant   && e.isCompliant !== true)       return false;
     if (crit.excludeLegacyAuth  && LEGACY_APP_TYPES.has(e.clientAppUsed)) return false;
@@ -160,14 +169,7 @@ function computeIsFullyCompliant(user: UserSummary, crit: ComplianceCriteria): b
 // mirrors the skip logic in computeIsFullyCompliant so that the column
 // state icons reflect the same view as the compliance calculation.
 function getFilteredEntries(entries: SignInEntry[], crit: ComplianceCriteria): SignInEntry[] {
-  const excluded = new Set(crit.excludedApps);
-  return entries.filter(e => {
-    if (excluded.size > 0 && e.appsAccessed.length > 0 && e.appsAccessed.every(a => excluded.has(a))) return false;
-    if (crit.excludeMobile && isMobileEntry(e)) {
-      if (!crit.includeManagedMobile || !e.isManaged) return false;
-    }
-    return true;
-  });
+  return entries.filter(e => !entrySkipReason(e, crit));
 }
 
 // Per-user column state helpers
@@ -360,16 +362,17 @@ function Toggle({ value, onChange, label }: { value: boolean; onChange: (v: bool
   );
 }
 
-function Checkbox({ checked }: { checked: boolean }) {
+function Checkbox({ checked, indeterminate }: { checked: boolean; indeterminate?: boolean }) {
   return (
     <div style={{
-      width: 16, height: 16, borderRadius: 4, flexShrink: 0,
-      border: `2px solid ${checked ? C.green : C.muted}`,
-      background: checked ? C.green : 'transparent',
+      width: 16, height: 16, borderRadius: 4, flexShrink: 0, boxSizing: 'border-box',
+      border: `2px solid ${checked || indeterminate ? C.green : C.muted}`,
+      background: checked && !indeterminate ? C.green : 'transparent',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       transition: 'border-color 0.1s, background 0.1s',
     }}>
-      {checked && <svg width="9" height="7" viewBox="0 0 9 7" fill="none"><path d="M1 3.5L3.5 6L8 1" stroke="#000" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+      {checked && !indeterminate && <svg width="9" height="7" viewBox="0 0 9 7" fill="none"><path d="M1 3.5L3.5 6L8 1" stroke="#000" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+      {indeterminate && !checked && <div style={{ width: 8, height: 2, borderRadius: 1, background: C.green }} />}
     </div>
   );
 }
@@ -458,9 +461,11 @@ function DeviceReferenceDates({ entry }: { entry: SignInEntry }) {
 function DeviceDailyBreakdown({
   slices,
   namedLocations,
+  excludedApps,
 }: {
   slices: DailySignInSlice[];
   namedLocations: NamedLocationRecord[];
+  excludedApps: string[];
 }) {
   return (
     <div style={{ padding: '8px 10px 10px 28px', background: 'rgba(0,0,0,0.2)' }}>
@@ -485,7 +490,7 @@ function DeviceDailyBreakdown({
                 {' – '}
                 {new Date(s.lastSignIn).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
               </td>
-              <td style={{ padding: '5px 8px' }}>{s.appsAccessed.join(', ') || '—'}</td>
+              <td style={{ padding: '5px 8px' }}><AppsList apps={s.appsAccessed} excludedApps={excludedApps} /></td>
               <td style={{ padding: '5px 8px', maxWidth: 160 }}>
                 <IpNamedLocationCell ips={s.ipAddresses} namedLocations={namedLocations} />
               </td>
@@ -502,12 +507,35 @@ function DeviceDailyBreakdown({
   );
 }
 
+function AppsList({ apps, excludedApps }: { apps: string[]; excludedApps: string[] }) {
+  if (apps.length === 0) return <>—</>;
+  const excluded = new Set(excludedApps);
+  const shown = apps.slice(0, 2);
+  return (
+    <span title={apps.join(', ')}>
+      {shown.map((app, i) => (
+        <span
+          key={`${app}-${i}`}
+          style={excluded.has(app)
+            ? { textDecoration: 'line-through', color: C.muted }
+            : { color: C.body }}
+        >
+          {i > 0 ? ', ' : ''}{app}
+        </span>
+      ))}
+      {apps.length > 2 && <span style={{ color: C.muted }}>{` +${apps.length - 2}`}</span>}
+    </span>
+  );
+}
+
 function UserEntries({
   entries,
   namedLocations,
+  criteria,
 }: {
   entries: SignInEntry[];
   namedLocations: NamedLocationRecord[];
+  criteria: ComplianceCriteria;
 }) {
   const [expandedDevices, setExpandedDevices] = useState<Set<string>>(new Set());
 
@@ -538,10 +566,17 @@ function UserEntries({
               const slices = e.dailyBreakdown ?? [];
               const canExpand = slices.length > 1 || e.signInCount > 1;
               const isExpanded = expandedDevices.has(rowKey);
+              const skipReason = entrySkipReason(e, criteria);
               return (
                 <Fragment key={rowKey || i}>
                   <tr
-                    style={{ borderBottom: isExpanded ? 'none' : `1px solid ${C.border}`, color: C.body, cursor: canExpand ? 'pointer' : 'default' }}
+                    title={skipReason ?? undefined}
+                    style={{
+                      borderBottom: isExpanded ? 'none' : `1px solid ${C.border}`,
+                      color: C.body,
+                      cursor: canExpand ? 'pointer' : 'default',
+                      opacity: skipReason ? 0.55 : 1,
+                    }}
                     onClick={canExpand ? () => toggleDevice(rowKey) : undefined}
                   >
                     <td style={{ padding: '7px 4px', textAlign: 'center', color: canExpand ? C.blue : C.muted, verticalAlign: 'top' }}>
@@ -559,14 +594,15 @@ function UserEntries({
                     </td>
                     <td style={{ padding: '7px 10px', whiteSpace: 'nowrap' }}>{e.operatingSystem || '—'}</td>
                     <td style={{ padding: '7px 10px' }}><TrustBadge trustType={e.trustType} /></td>
-                    <td style={{ padding: '7px 10px' }}><CompliantBadge isCompliant={e.isCompliant} isManaged={e.isManaged} /></td>
+                    <td style={{ padding: '7px 10px' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+                        <CompliantBadge isCompliant={e.isCompliant} isManaged={e.isManaged} />
+                        {skipReason && <Badge label="Excluded" color={C.blue} bg={C.blueBg} />}
+                      </div>
+                    </td>
                     <td style={{ padding: '7px 10px' }}><ClientBadge clientAppUsed={e.clientAppUsed} browser={e.browser} /></td>
-                    <td style={{ padding: '7px 10px', maxWidth: 180 }} title="Interactive sign-ins tied to this device in backup">
-                      <span title={e.appsAccessed.join(', ')} style={{ color: C.body }}>
-                        {e.appsAccessed.length > 0
-                          ? e.appsAccessed.slice(0, 2).join(', ') + (e.appsAccessed.length > 2 ? ` +${e.appsAccessed.length - 2}` : '')
-                          : '—'}
-                      </span>
+                    <td style={{ padding: '7px 10px', maxWidth: 180 }} title={skipReason ?? 'Interactive sign-ins tied to this device in backup'}>
+                      <AppsList apps={e.appsAccessed} excludedApps={criteria.excludedApps} />
                     </td>
                     <td style={{ padding: '7px 10px', maxWidth: 200, verticalAlign: 'top' }}>
                       <IpNamedLocationCell ips={e.ipAddresses} namedLocations={namedLocations} />
@@ -591,7 +627,7 @@ function UserEntries({
                   {isExpanded && slices.length > 0 && (
                     <tr style={{ borderBottom: `1px solid ${C.border}` }}>
                       <td colSpan={10} style={{ padding: 0 }}>
-                        <DeviceDailyBreakdown slices={slices} namedLocations={namedLocations} />
+                        <DeviceDailyBreakdown slices={slices} namedLocations={namedLocations} excludedApps={criteria.excludedApps} />
                       </td>
                     </tr>
                   )}
@@ -636,6 +672,7 @@ export default function UserComplianceClient({ tenants }: Props) {
   const [actionMsg,     setActionMsg]     = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [exportMsg,     setExportMsg]     = useState<string | null>(null);
   const [lastRun,       setLastRun]       = useState<LastRunResult | null>(null);
+  const [groupsNeeded,  setGroupsNeeded]  = useState(false);
 
   // Group membership filter — multiple conditions with AND / OR logic
   interface GroupFilterRow { id: string; groupKey: string; mode: 'member' | 'not-member' }
@@ -644,13 +681,29 @@ export default function UserComplianceClient({ tenants }: Props) {
   // Cache: groupKey → Set<userId>  (null = still loading, undefined = not fetched)
   const [memberCache,      setMemberCache]      = useState<Record<string, Set<string> | null>>({});
 
+  // Ignore in-flight responses after tenant/days change (first load is 30d and slow).
+  const requestKeyRef = useRef('');
+  const tenantSlugRef = useRef(tenantSlug);
+  tenantSlugRef.current = tenantSlug;
+  const abortRef = useRef<AbortController | null>(null);
+
   // ── Fetch compliance data ─────────────────────────────────────────────────
 
   const fetchData = useCallback(async () => {
     if (!tenantSlug) return;
+    const requestKey = `${tenantSlug}:${days}`;
+    requestKeyRef.current = requestKey;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true); setError(null); setData(null); setSelectedUsers(new Set());
     try {
-      const res = await fetch(`/api/tenants/${tenantSlug}/user-compliance?days=${days}`);
+      const res = await fetch(`/api/tenants/${encodeURIComponent(tenantSlug)}/user-compliance?days=${days}`, {
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      if (requestKeyRef.current !== requestKey) return;
       if (!res.ok) {
         const body = await res.json().catch(() => ({})) as { detail?: string; error?: string };
         setError(res.status === 402
@@ -658,37 +711,58 @@ export default function UserComplianceClient({ tenants }: Props) {
           : (body.error ?? `HTTP ${res.status}`));
         return;
       }
-      setData(await res.json() as ComplianceData);
-    } catch (e) { setError(String(e)); }
-    finally     { setLoading(false); }
+      const json = await res.json() as ComplianceData;
+      if (requestKeyRef.current !== requestKey) return;
+      setData(json);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return;
+      if (requestKeyRef.current !== requestKey) return;
+      setError(String(e));
+    } finally {
+      if (requestKeyRef.current === requestKey) setLoading(false);
+    }
   }, [tenantSlug, days]);
 
-  useEffect(() => { void fetchData(); }, [fetchData]);
+  useEffect(() => {
+    void fetchData();
+    return () => { abortRef.current?.abort(); };
+  }, [fetchData]);
 
   // ── Fetch last run result ─────────────────────────────────────────────────
 
   const fetchLastRun = useCallback(async () => {
     if (!tenantSlug) return;
+    const slug = tenantSlug;
     try {
-      const res  = await fetch(`/api/git/file?slug=${tenantSlug}&path=config/group-action-last-run.json`);
+      const res  = await fetch(`/api/git/file?slug=${encodeURIComponent(slug)}&path=config/group-action-last-run.json`);
       if (!res.ok) return;
       const body = await res.json() as { exists: boolean; content: string };
+      if (tenantSlugRef.current !== slug) return;
       if (body.exists) setLastRun(JSON.parse(body.content) as LastRunResult);
     } catch { /* not yet written */ }
   }, [tenantSlug]);
 
   useEffect(() => { void fetchLastRun(); }, [fetchLastRun]);
 
-  // ── Fetch security groups (lazy — needed for action panel or group filter) ─
+  // Drop membership / group state from the previous tenant so filters refetch.
+  useEffect(() => {
+    setGroups([]);
+    setSelectedGroup('');
+    setMemberCache({});
+    setLastRun(null);
+    setActionMsg(null);
+  }, [tenantSlug]);
 
-  const [groupsNeeded, setGroupsNeeded] = useState(false);
+  // ── Fetch security groups (lazy — needed for action panel or group filter) ─
 
   useEffect(() => {
     if ((!groupsNeeded && selectedUsers.size === 0) || !tenantSlug || groups.length > 0) return;
+    const slug = tenantSlug;
     setGroupsLoading(true);
-    fetch(`/api/tenants/${tenantSlug}/security-groups`)
+    fetch(`/api/tenants/${encodeURIComponent(slug)}/security-groups`)
       .then(r => r.json() as Promise<{ groups: SecurityGroup[] }>)
       .then(body => {
+        if (tenantSlugRef.current !== slug) return;
         setGroups(body.groups ?? []);
         // Do not auto-pick the first group — require an explicit choice before add/remove.
         setSelectedGroup(prev => {
@@ -698,7 +772,9 @@ export default function UserComplianceClient({ tenants }: Props) {
         });
       })
       .catch(() => { /* silent */ })
-      .finally(() => setGroupsLoading(false));
+      .finally(() => {
+        if (tenantSlugRef.current === slug) setGroupsLoading(false);
+      });
   }, [groupsNeeded, selectedUsers.size, tenantSlug, groups.length]);
 
   // ── Fetch membership for any group in the filter list not yet cached ─────
@@ -717,13 +793,20 @@ export default function UserComplianceClient({ tenants }: Props) {
       return next;
     });
 
+    const slug = tenantSlug;
     for (const key of uncached) {
       const group    = groups.find(g => (g.id || g.displayName) === key);
       const groupName = group?.displayName ?? key;
-      fetch(`/api/tenants/${tenantSlug}/group-membership?groupName=${encodeURIComponent(groupName)}`)
+      fetch(`/api/tenants/${encodeURIComponent(slug)}/group-membership?groupName=${encodeURIComponent(groupName)}`)
         .then(r => r.json() as Promise<{ memberIds: string[] }>)
-        .then(body => setMemberCache(prev => ({ ...prev, [key]: new Set(body.memberIds ?? []) })))
-        .catch(()  => setMemberCache(prev => ({ ...prev, [key]: new Set() })));
+        .then(body => {
+          if (tenantSlugRef.current !== slug) return;
+          setMemberCache(prev => ({ ...prev, [key]: new Set(body.memberIds ?? []) }));
+        })
+        .catch(() => {
+          if (tenantSlugRef.current !== slug) return;
+          setMemberCache(prev => ({ ...prev, [key]: new Set() }));
+        });
     }
   }, [groupFilters, tenantSlug, groups, memberCache]);
 
@@ -776,8 +859,21 @@ export default function UserComplianceClient({ tenants }: Props) {
   function toggleUser(userId: string) {
     setSelectedUsers(prev => { const n = new Set(prev); n.has(userId) ? n.delete(userId) : n.add(userId); return n; });
   }
-  function selectAllCompliant() { setSelectedUsers(new Set(computedUsers.filter(u => u.isFullyCompliantComputed).map(u => u.userId))); }
+  function selectAllCompliant() { setSelectedUsers(new Set(filteredUsers.filter(u => u.isFullyCompliantComputed).map(u => u.userId))); }
   function clearSelection()     { setSelectedUsers(new Set()); }
+  const allVisibleSelected = filteredUsers.length > 0 && filteredUsers.every(u => selectedUsers.has(u.userId));
+  const someVisibleSelected = !allVisibleSelected && filteredUsers.some(u => selectedUsers.has(u.userId));
+  function toggleSelectAllVisible() {
+    setSelectedUsers(prev => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        for (const u of filteredUsers) next.delete(u.userId);
+      } else {
+        for (const u of filteredUsers) next.add(u.userId);
+      }
+      return next;
+    });
+  }
   function toggleExpand(userId: string) {
     setExpandedUsers(prev => { const n = new Set(prev); n.has(userId) ? n.delete(userId) : n.add(userId); return n; });
   }
@@ -913,7 +1009,7 @@ export default function UserComplianceClient({ tenants }: Props) {
       {/* ── Controls bar ──────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 20 }}>
         {tenants.length > 1 && (
-          <select value={tenantSlug} onChange={e => { setTenantSlug(e.target.value); setGroups([]); setSelectedGroup(''); }}
+          <select value={tenantSlug} onChange={e => setTenantSlug(e.target.value)}
             style={{ background: C.surface, border: `1px solid ${C.border}`, color: C.text, borderRadius: 6, padding: '6px 10px', fontSize: '0.8125rem', fontFamily: 'inherit', outline: 'none', cursor: 'pointer' }}>
             {tenants.map(t => <option key={t.slug} value={t.slug}>{t.displayName}</option>)}
           </select>
@@ -1304,7 +1400,21 @@ export default function UserComplianceClient({ tenants }: Props) {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8125rem' }}>
             <thead>
               <tr style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, color: C.muted, fontWeight: 600, fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                <th style={{ width: 48, padding: '9px 0' }} />
+                <th style={{ width: 36, padding: '9px 0 9px 12px', textAlign: 'left', verticalAlign: 'middle' }}>
+                  <button
+                    type="button"
+                    onClick={toggleSelectAllVisible}
+                    title={allVisibleSelected ? 'Deselect all visible users' : 'Select all visible users'}
+                    aria-label={allVisibleSelected ? 'Deselect all visible users' : 'Select all visible users'}
+                    aria-pressed={allVisibleSelected}
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+                    }}
+                  >
+                    <Checkbox checked={allVisibleSelected} indeterminate={someVisibleSelected} />
+                  </button>
+                </th>
                 <th style={{ textAlign: 'left', padding: '9px 8px 9px 0', fontWeight: 600 }}>User</th>
                 <th style={{ width: 84, textAlign: 'center', padding: '9px 8px', borderLeft: `1px solid ${C.border}`, fontWeight: 600 }}>Joined</th>
                 <th style={{ width: 94, textAlign: 'center', padding: '9px 8px', borderLeft: `1px solid ${C.border}`, fontWeight: 600 }}>Compliant</th>
@@ -1342,11 +1452,13 @@ export default function UserComplianceClient({ tenants }: Props) {
                       <td
                         onClick={e => { e.stopPropagation(); toggleUser(user.userId); }}
                         title={isSelected ? 'Deselect' : 'Select'}
-                        style={{ textAlign: 'center', verticalAlign: 'middle', padding: '12px 0' }}
+                        style={{ verticalAlign: 'top', padding: '10px 0 10px 12px' }}
                       >
-                        <Checkbox checked={isSelected} />
+                        <div style={{ display: 'flex', alignItems: 'center', height: '1.25em' }}>
+                          <Checkbox checked={isSelected} />
+                        </div>
                       </td>
-                      <td style={{ padding: '10px 8px 10px 0', verticalAlign: 'middle' }}>
+                      <td style={{ padding: '10px 8px 10px 0', verticalAlign: 'top' }}>
                         <div style={{ fontWeight: 500, color: C.white }}>{user.userDisplayName || user.userPrincipalName}</div>
                         {user.userDisplayName && <div style={{ color: C.muted, fontSize: '0.75rem' }}>{user.userPrincipalName}</div>}
                       </td>
@@ -1374,7 +1486,7 @@ export default function UserComplianceClient({ tenants }: Props) {
                     {isExpanded && (
                       <tr style={{ borderBottom: isLast ? 'none' : `1px solid ${C.border}` }}>
                         <td colSpan={8} style={{ padding: 0 }}>
-                          <UserEntries entries={user.entries} namedLocations={namedLocations} />
+                          <UserEntries entries={user.entries} namedLocations={namedLocations} criteria={criteria} />
                         </td>
                       </tr>
                     )}

@@ -15,9 +15,9 @@
 #   RESOURCE_GROUP         — Azure resource group containing the web app
 #
 # ── Optional GitHub Variables ────────────────────────────────────────────────
-#   GHCR_IMAGE             — default ghcr.io/potsolutions/config365-preview
-#                            — use ghcr.io/potsolutions/config365 for GA channel
-#   RELEASE_REPO           — default potsolutions/config365-preview (manifest check)
+#   GHCR_IMAGE             — default ghcr.io/potsolutions/config365 (GA)
+#                            — use ghcr.io/potsolutions/config365-preview for preview
+#   RELEASE_REPO           — default potsolutions/config365 (manifest check)
 
 name: Deploy
 
@@ -49,7 +49,7 @@ jobs:
         env:
           RELEASE_REPO: ${{ vars.RELEASE_REPO }}
         run: |
-          REPO="${RELEASE_REPO:-potsolutions/config365-preview}"
+          REPO="${RELEASE_REPO:-potsolutions/config365}"
           VERSION=$(cat VERSION)
           echo "app_version=${VERSION}" >> "$GITHUB_OUTPUT"
           NEEDS_IMAGE=false
@@ -75,7 +75,7 @@ jobs:
           GHCR_IMAGE: ${{ vars.GHCR_IMAGE }}
         run: |
           set -euo pipefail
-          IMAGE="${GHCR_IMAGE:-ghcr.io/potsolutions/config365-preview}"
+          IMAGE="${GHCR_IMAGE:-ghcr.io/potsolutions/config365}"
           FULL_IMAGE="${IMAGE}:${IMAGE_TAG}"
           echo "Deploying ${FULL_IMAGE} to App Service ${{ vars.APP_NAME }}"
 

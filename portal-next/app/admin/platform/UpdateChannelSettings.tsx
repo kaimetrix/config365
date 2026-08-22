@@ -17,7 +17,7 @@ const CHANNEL_LABEL: Record<UpdateChannel, string> = {
 
 export default function UpdateChannelSettings() {
   const [saved, setSaved] = useState<ChannelState | null>(null);
-  const [channel, setChannel] = useState<UpdateChannel>('preview');
+  const [channel, setChannel] = useState<UpdateChannel>('ga');
   const [repoOverrideInput, setRepoOverrideInput] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [ack, setAck] = useState(false);

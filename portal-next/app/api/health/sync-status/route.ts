@@ -3,7 +3,6 @@ import {
   syncScriptsToGitea,
   getScriptsSyncStatus,
 } from '@/lib/server/platform-bootstrap';
-import { startStuckSetupSweep } from '@/lib/server/actions-unstick';
 
 /**
  * GET /api/health/sync-status
@@ -29,6 +28,5 @@ export function GET() {
   }
 
   const status = getScriptsSyncStatus();
-  startStuckSetupSweep();
   return NextResponse.json({ synced: status.done, inProgress: status.inProgress });
 }

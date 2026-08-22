@@ -3,12 +3,23 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { toGiteaWebUrl } from '@/lib/utils';
 import { normalizeForCompare } from '@/lib/normalize-for-compare';
 import {
+  applyOverlayToDeviceConfigJson,
+  detectCollectionFromPolicy,
+  diffAppLockerXml,
+  extractOmaSetting,
+  isAppLockerFileName,
+  overlayPath,
+  parseOverlayJson,
+  type AppLockerXmlDiff,
+} from '@/lib/applocker';
+import {
   applyFieldFilter,
   getFolderSidecarPath,
   getSidecarPath,
   mergeMonitorConfigs,
   parseMonitorConfig,
 } from '@/lib/monitor-config';
+import { diffXmlEntries, expandXmlInJson, interpretOmaXmlLines, looksLikeXml, meaningfulOmaLines } from '@/lib/xml-entries';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -259,7 +270,17 @@ function formatAssignmentJson(raw: string): string {
 function countChanges(item: PlanItem): number {
   const c = normalizeChanges(item.changes);
   if (!c) return 0;
-  return (c.Modified?.length ?? 0) + (c.Added?.length ?? 0) + (c.Removed?.length ?? 0) + (c.OmaSettings?.length ?? 0);
+  const oma = interpretOmaChangeCount(c.OmaSettings);
+  return (c.Modified?.length ?? 0) + (c.Added?.length ?? 0) + (c.Removed?.length ?? 0) + oma;
+}
+
+function interpretOmaChangeCount(lines: string[] | undefined): number {
+  if (!lines?.length) return 0;
+  const interpreted = interpretOmaXmlLines(lines);
+  if (interpreted.kind === 'match') return 0;
+  if (interpreted.diffs.length > 0) return interpreted.diffs.length;
+  if (interpreted.kind === 'truncated') return 1;
+  return meaningfulOmaLines(lines).length;
 }
 
 function toStr(v: unknown): string {
@@ -271,6 +292,17 @@ function toStr(v: unknown): string {
 type ObjDiff = { type: 'change' | 'add' | 'remove'; key: string; existing?: unknown; desired?: unknown };
 
 function computeObjectDiff(existingStr: string, desiredStr: string): ObjDiff[] | null {
+  if (looksLikeXml(existingStr) && looksLikeXml(desiredStr)) {
+    const xmlDiffs = diffXmlEntries(existingStr, desiredStr);
+    if (xmlDiffs) {
+      return xmlDiffs.map(d => ({
+        type: d.type,
+        key: d.label || d.key,
+        existing: d.existing,
+        desired: d.desired,
+      }));
+    }
+  }
   try {
     const existing = JSON.parse(existingStr);
     const desired  = JSON.parse(desiredStr);
@@ -282,7 +314,25 @@ function computeObjectDiff(existingStr: string, desiredStr: string): ObjDiff[] |
       const hasD = Object.prototype.hasOwnProperty.call(desired, k);
       if (!hasE)                                                          diffs.push({ type: 'add',    key: k, desired:  desired[k] });
       else if (!hasD)                                                     diffs.push({ type: 'remove', key: k, existing: existing[k] });
-      else if (JSON.stringify(existing[k]) !== JSON.stringify(desired[k])) diffs.push({ type: 'change', key: k, existing: existing[k], desired: desired[k] });
+      else if (JSON.stringify(existing[k]) !== JSON.stringify(desired[k])) {
+        const ev = existing[k];
+        const dv = desired[k];
+        if (typeof ev === 'string' && typeof dv === 'string' && looksLikeXml(ev) && looksLikeXml(dv)) {
+          const xmlDiffs = diffXmlEntries(ev, dv) ?? [];
+          if (xmlDiffs.length > 0) {
+            for (const d of xmlDiffs) {
+              diffs.push({
+                type: d.type,
+                key: `${k}.${d.label || d.key}`,
+                existing: d.existing,
+                desired: d.desired,
+              });
+            }
+            continue;
+          }
+        }
+        diffs.push({ type: 'change', key: k, existing: existing[k], desired: desired[k] });
+      }
     }
     return diffs;
   } catch { return null; }
@@ -307,14 +357,60 @@ function ExpandableValue({ value, color }: { value: string; color: string }) {
 
 function DiffCell({ value, color }: { value: string; color: string }) {
   if (!value) return <span style={{ color: '#3f3f46', fontStyle: 'italic', fontSize: '0.75rem' }}>—</span>;
-  if (value.length <= 120) return <span style={{ fontFamily: 'monospace', fontSize: '0.75rem', color, wordBreak: 'break-word' }}>{value}</span>;
+  const multiline = value.includes('\n');
+  if (!multiline && value.length <= 120) return <span style={{ fontFamily: 'monospace', fontSize: '0.75rem', color, wordBreak: 'break-word' }}>{value}</span>;
   return (
-    <details>
+    <details open={multiline}>
       <summary style={{ cursor: 'pointer', fontFamily: 'monospace', fontSize: '0.75rem', color, listStyle: 'none', outline: 'none' }}>
-        {value.slice(0, 80)}… <span style={{ color: '#52525b', fontSize: '0.65rem' }}>[expand]</span>
+        {multiline ? value.split('\n')[0] : value.slice(0, 80)}… <span style={{ color: '#52525b', fontSize: '0.65rem' }}>[xml]</span>
       </summary>
-      <pre style={{ margin: '4px 0 0', padding: 8, background: '#0a0a0c', border: '1px solid #27272a', borderRadius: 4, fontSize: '0.7rem', color, whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 300, overflowY: 'auto' }}>{value}</pre>
+      <pre style={{ margin: '4px 0 0', padding: 8, background: '#0a0a0c', border: '1px solid #27272a', borderRadius: 4, fontSize: '0.7rem', color, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 300, overflowY: 'auto' }}>{value}</pre>
     </details>
+  );
+}
+
+function extractOmaXmlFromPolicyJson(raw: string | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const json = JSON.parse(raw) as Record<string, unknown>;
+    const oma = extractOmaSetting(json);
+    return oma?.value || null;
+  } catch {
+    return null;
+  }
+}
+
+function XmlRuleDiffTable({ diffs }: { diffs: AppLockerXmlDiff[] }) {
+  if (diffs.length === 0) {
+    return (
+      <div style={{ textAlign: 'center', padding: '24px 0', color: '#52525b', fontSize: '0.8rem' }}>
+        AppLocker rules match.
+      </div>
+    );
+  }
+  return (
+    <table style={{ width: '100%', borderCollapse: 'collapse', border: '1px solid #1a1a1d', borderRadius: 6, overflow: 'hidden' }}>
+      <thead>
+        <tr style={{ background: '#0d0d10' }}>
+          <th style={{ padding: '8px 10px', textAlign: 'left', fontSize: '0.65rem', color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600, borderBottom: '1px solid #27272a', borderRight: '1px solid #1a1a1d' }}>Rule</th>
+          <th style={{ padding: '8px 10px', textAlign: 'left', fontSize: '0.65rem', color: '#f87171', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600, borderBottom: '1px solid #27272a', borderRight: '1px solid #1a1a1d' }}>Current</th>
+          <th style={{ padding: '8px 10px', textAlign: 'left', fontSize: '0.65rem', color: '#22c55e', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600, borderBottom: '1px solid #27272a' }}>Desired</th>
+        </tr>
+      </thead>
+      <tbody>
+        {diffs.map((d, i) => {
+          const stripe = i % 2 ? '#ffffff03' : 'transparent';
+          const sym = d.type === 'add' ? '+' : d.type === 'remove' ? '-' : '~';
+          return (
+            <tr key={`${d.key}-${i}`} style={{ background: stripe, borderBottom: '1px solid #1a1a1d' }}>
+              <td style={{ ...tdProp, verticalAlign: 'top' }}>{sym} {d.label}</td>
+              <td style={tdExisting}>{d.type !== 'add' ? <DiffCell value={d.existing ?? ''} color="#f87171" /> : emptyCell}</td>
+              <td style={tdDesired}>{d.type !== 'remove' ? <DiffCell value={d.desired ?? ''} color="#22c55e" /> : emptyCell}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 
@@ -323,7 +419,8 @@ function DiffCell({ value, color }: { value: string; color: string }) {
 function PropertyChanges({ item }: { item: PlanItem }) {
   const c = normalizeChanges(item.changes);
   if (!c) return null;
-  const hasContent = (c.Modified?.length ?? 0) + (c.Added?.length ?? 0) + (c.Removed?.length ?? 0) + (c.OmaSettings?.length ?? 0) > 0;
+  const omaLines = meaningfulOmaLines(c.OmaSettings);
+  const hasContent = (c.Modified?.length ?? 0) + (c.Added?.length ?? 0) + (c.Removed?.length ?? 0) + omaLines.length > 0;
   if (!hasContent) return null;
 
   return (
@@ -429,7 +526,7 @@ function PropertyChanges({ item }: { item: PlanItem }) {
       {c.Removed?.map((r, i) => (
         <div key={`r${i}`} style={{ fontSize: '0.72rem', color: '#f87171', fontFamily: 'monospace', marginBottom: 2 }}>- {r}</div>
       ))}
-      {c.OmaSettings?.map((o, i) => (
+      {omaLines.map((o, i) => (
         <div key={`o${i}`} style={{ fontSize: '0.72rem', color: '#a78bfa', fontFamily: 'monospace', marginBottom: 2 }}>  {o}</div>
       ))}
     </div>
@@ -584,6 +681,7 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
   const [tab, setTab] = useState<'changes' | 'files'>('changes');
   const [baselineJson, setBaselineJson] = useState<string | null>(null);
   const [tenantJson,   setTenantJson]   = useState<string | null>(null);
+  const [applockerDiffs, setApplockerDiffs] = useState<AppLockerXmlDiff[] | null>(null);
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesError,   setFilesError]   = useState('');
 
@@ -596,7 +694,7 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
 
   // Fetch full files when the Files tab is activated
   useEffect(() => {
-    if (tab !== 'files' || baselineJson !== null || tenantJson !== null) return;
+    if (baselineJson !== null || tenantJson !== null) return;
     const relPaths = buildFilePaths(item);
     if (!relPaths.length) { setFilesError('Cannot resolve file path for this item.'); return; }
     setFilesLoading(true);
@@ -628,7 +726,7 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
         const normalized = normalizeForCompare(s ?? '{}', relPath);
         const parsed = JSON.parse(normalized) as unknown;
         const filtered = monitor ? applyFieldFilter(parsed, monitor) : parsed;
-        return JSON.stringify(filtered, null, 2);
+        return JSON.stringify(expandXmlInJson(filtered), null, 2);
       } catch { return s ?? ''; }
     };
     Promise.all([
@@ -647,9 +745,32 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
       const resolvedVars = varsRes.variables ?? {};
       // Expand {{VAR:Name}} tokens to this tenant's resolved values before diffing,
       // so "Desired (baseline)" shows what will actually be deployed, not the raw token.
-      const baselineContent = bl.exists && bl.content ? applyVariableTokens(bl.content, resolvedVars) : bl.content;
+      let baselineContent = bl.exists && bl.content ? applyVariableTokens(bl.content, resolvedVars) : bl.content;
+      let tenantContent = tn.exists ? tn.content : undefined;
+      const fileName = relPath.split('/').at(-1) ?? relPath;
+      if (isAppLockerFileName(fileName)) {
+        const type = detectCollectionFromPolicy(fileName);
+        if (type) {
+          const overlayRes = await fetch(
+            `/api/git/file?slug=${encodeURIComponent(tenantSlug)}&path=${encodeURIComponent(overlayPath(type))}`,
+          ).then(r => r.json()).catch(() => ({ exists: false })) as { exists?: boolean; content?: string };
+          const overlay = overlayRes.exists && overlayRes.content
+            ? parseOverlayJson((() => { try { return JSON.parse(overlayRes.content as string); } catch { return {}; } })())
+            : null;
+          if (baselineContent) baselineContent = applyOverlayToDeviceConfigJson(baselineContent, overlay, fileName);
+          // Canonicalize tenant XML the same way so whitespace/order is not a false diff.
+          if (tenantContent) tenantContent = applyOverlayToDeviceConfigJson(tenantContent, null, fileName);
+        }
+      }
+      const currentXml = extractOmaXmlFromPolicyJson(tenantContent);
+      const desiredXml = extractOmaXmlFromPolicyJson(baselineContent);
+      if (currentXml && desiredXml) {
+        setApplockerDiffs(diffAppLockerXml(currentXml, desiredXml) ?? []);
+      } else {
+        setApplockerDiffs(null);
+      }
       setBaselineJson(bl.exists ? fmt(baselineContent, relPath, monitor) : '(not found in baseline)');
-      setTenantJson(tn.exists ? fmt(tn.content, relPath, monitor) : '(not found in tenant backup)');
+      setTenantJson(tn.exists ? fmt(tenantContent, relPath, monitor) : '(not found in tenant backup)');
     }).catch(() => setFilesError('Failed to fetch files.'))
       .finally(() => setFilesLoading(false));
   }, [tab, baselineJson, tenantJson, item, mspOrg, tenantSlug]);
@@ -809,6 +930,19 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
 
           {tab === 'changes' && (
             <>
+              {filesLoading && !applockerDiffs && (
+                <div style={{ textAlign: 'center', padding: '20px 0', color: '#52525b', fontSize: '0.8rem' }}>Loading AppLocker XML…</div>
+              )}
+              {applockerDiffs && (
+                <div style={{ marginBottom: rows.length > 0 ? 16 : 0 }}>
+                  <div style={{ fontSize: '0.65rem', color: '#a78bfa', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8, fontWeight: 600 }}>
+                    {applockerDiffs.length === 0
+                      ? 'AppLocker rules'
+                      : `${applockerDiffs.length} AppLocker rule${applockerDiffs.length === 1 ? '' : 's'} differ`}
+                  </div>
+                  <XmlRuleDiffTable diffs={applockerDiffs} />
+                </div>
+              )}
               {rows.length > 0 ? (
                 <table style={{ width: '100%', borderCollapse: 'collapse', border: '1px solid #1a1a1d', borderRadius: 6, overflow: 'hidden' }}>
                   <thead>
@@ -820,15 +954,15 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
                   </thead>
                   <tbody>{rows}</tbody>
                 </table>
-              ) : !c ? (
+              ) : !c && !applockerDiffs ? (
                 <div style={{ textAlign: 'center', padding: '40px 0', color: '#52525b' }}>This is a new resource — no existing values to compare.</div>
-              ) : (
+              ) : !applockerDiffs && !filesLoading ? (
                 <div style={{ textAlign: 'center', padding: '40px 0', color: '#52525b' }}>No detailed diff available.</div>
-              )}
-              {c?.OmaSettings && c.OmaSettings.length > 0 && (
+              ) : null}
+              {!applockerDiffs && meaningfulOmaLines(c?.OmaSettings).length > 0 && (
                 <div style={{ marginTop: 12, padding: 10, background: '#09090b', borderRadius: 6, border: '1px solid #1a1a1d' }}>
                   <div style={{ fontSize: '0.65rem', color: '#a78bfa', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6, fontWeight: 600 }}>OMA-URI Settings</div>
-                  {c.OmaSettings.map((o, i) => <div key={i} style={{ fontFamily: 'monospace', fontSize: '0.75rem', color: '#a78bfa', marginBottom: 3 }}>{o}</div>)}
+                  {meaningfulOmaLines(c?.OmaSettings).map((o, i) => <div key={i} style={{ fontFamily: 'monospace', fontSize: '0.75rem', color: '#a78bfa', marginBottom: 3 }}>{o}</div>)}
                 </div>
               )}
             </>
@@ -840,7 +974,7 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
               {filesError  && <div style={{ textAlign: 'center', padding: '40px 0', color: '#f87171', fontSize: '0.85rem' }}>{filesError}</div>}
               {!filesLoading && !filesError && baselineJson !== null && tenantJson !== null && (() => {
                 // tenant = current (b/before), baseline = desired (a/after)
-                const lines = computeLineDiff(tenantJson, baselineJson);
+                const allLines = computeLineDiff(tenantJson, baselineJson);
                 const colBase = { width: '50%', verticalAlign: 'top', fontFamily: 'monospace', fontSize: '0.72rem', padding: '1px 10px', whiteSpace: 'pre-wrap' as const, wordBreak: 'break-all' as const };
                 return (
                   <div style={{ border: '1px solid #1a1a1d', borderRadius: 6, overflow: 'hidden' }}>
@@ -850,7 +984,7 @@ function DiffModal({ item, onClose, mspSlug, mspOrg, tenantSlug }: { item: PlanI
                     </div>
                     <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                       <tbody>
-                        {lines.map((ln, i) => {
+                        {allLines.map((ln, i) => {
                           const bBg = ln.same ? 'transparent' : ln.b ? 'rgba(248,113,113,0.08)' : 'transparent';
                           const aBg = ln.same ? 'transparent' : ln.a ? 'rgba(34,197,94,0.08)'  : 'transparent';
                           const bColor = ln.same ? '#a1a1aa' : ln.b ? '#fca5a5' : '#3f3f46';

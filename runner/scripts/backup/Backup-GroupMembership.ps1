@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Backs up security group membership (user members only).
+    Backs up security group membership (user and device members).
 
 .DESCRIPTION
-    For every security group backed up by Backup-Groups.ps1, fetches the list of
-    user members and writes one JSON file per group under:
+    For every security group backed up by Backup-Groups.ps1, fetches user and
+    device members and writes one JSON file per group under:
         backups/group-membership/{safeGroupName}.json
 
     Format per file:
@@ -12,12 +12,17 @@
           "groupDisplayName": "...",
           "groupId": "...",
           "backedUpAt": "ISO-8601",
+          "memberCount": 0,
           "members": [
             { "id": "uuid", "userPrincipalName": "user@domain", "displayName": "..." }
+          ],
+          "deviceMemberCount": 0,
+          "deviceMembers": [
+            { "id": "object-id", "deviceId": "aad-device-id", "displayName": "..." }
           ]
         }
 
-    Only user members are included (device/group/service-principal members are skipped).
+    Nested group and service-principal members are skipped.
     Dynamic groups are included — their resolved members are backed up just like static groups.
 
 .PARAMETER BackupPath
@@ -79,7 +84,7 @@ try {
             # Fetch direct user members — use $select to get only needed fields and
             # filter to microsoft.graph.user to skip device/group/SP members.
             $memberUri = "https://graph.microsoft.com/v1.0/groups/$($group.id)/members/microsoft.graph.user?`$select=id,userPrincipalName,displayName"
-            $members   = Get-AllGraphResults -Uri $memberUri -Description "members of $($group.displayName)"
+            $members   = Get-AllGraphResults -Uri $memberUri -Description "user members of $($group.displayName)"
 
             $memberList = @($members | ForEach-Object {
                 [ordered]@{
@@ -89,17 +94,30 @@ try {
                 }
             })
 
+            $deviceUri  = "https://graph.microsoft.com/v1.0/groups/$($group.id)/members/microsoft.graph.device?`$select=id,deviceId,displayName"
+            $devices    = Get-AllGraphResults -Uri $deviceUri -Description "device members of $($group.displayName)"
+
+            $deviceList = @($devices | ForEach-Object {
+                [ordered]@{
+                    id          = [string]$_.id
+                    deviceId    = [string]$_.deviceId
+                    displayName = [string]$_.displayName
+                }
+            })
+
             $data = [ordered]@{
-                groupDisplayName = $group.displayName
-                groupId          = $group.id
-                backedUpAt       = (Get-Date -Format 'o')
-                memberCount      = $memberList.Count
-                members          = $memberList
+                groupDisplayName  = $group.displayName
+                groupId           = $group.id
+                backedUpAt        = (Get-Date -Format 'o')
+                memberCount       = $memberList.Count
+                members           = $memberList
+                deviceMemberCount = $deviceList.Count
+                deviceMembers     = $deviceList
             }
 
             Save-BackupFile -Content $data -RelativePath "$outputFolder/$safeFileName.json"
             $backedUp++
-            Write-Log "Group '$($group.displayName)': $($memberList.Count) members" "DEBUG"
+            Write-Log "Group '$($group.displayName)': $($memberList.Count) users, $($deviceList.Count) devices" "DEBUG"
         }
         catch {
             $failed++

@@ -88,6 +88,7 @@ import {
   formatBlockedUpdateError,
   formatNoUpdateError,
   githubReleaseTagUrl,
+  defaultUpdateChannel,
   inferRequiredPlatformVersion,
   repoForChannel,
   type UpdateChannel,
@@ -161,7 +162,9 @@ export interface UpdateChannelSettings {
 }
 
 function currentChannel(): UpdateChannel {
-  return getSetting('update_channel') === 'ga' ? 'ga' : 'preview';
+  const stored = getSetting('update_channel');
+  if (stored === 'preview' || stored === 'ga') return stored;
+  return defaultUpdateChannel();
 }
 
 function defaultRepo(): string {

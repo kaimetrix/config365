@@ -22,10 +22,6 @@ export {
   getOrCreateTokenEncryptionKey,
   recordRejectedRun,
   isRejectedRun,
-  wasUnstickAttempted,
-  recordUnstickAttempt,
-  lastWorkflowUnstickAt,
-  recordWorkflowUnstick,
 } from './settings-store';
 
 // ─── Types ────────────────────────────────────────────────────────────────────

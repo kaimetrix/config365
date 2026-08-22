@@ -1167,11 +1167,12 @@ jobs:
               exit 1
             }
           }
-          # Also handle the case where the issue was closed manually (e.g. by the portal UI) with no matching comment
+          # A closed issue is not an approval. Container restarts and stale-issue
+          # cleanup also close issues; treating that as approved would apply.
           $issueState = (Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum" -Headers $headers -ErrorAction SilentlyContinue).state
           if ($issueState -eq 'closed') {
-            Write-Host "Issue #$issueNum is already closed — treating as approved"
-            exit 0
+            Write-Host "Issue #$issueNum is closed with no approve/deny comment — failing closed"
+            exit 1
           }
 
           Write-Host "Waiting for approval on issue #$issueNum (timeout: 6 hours) ..."
@@ -1249,6 +1250,21 @@ jobs:
           # (/home/config365-data/...). Mark all dirs safe for this job.
           git config --global --add safe.directory '*'
           echo "Job session HOME=$HOME USERPROFILE=$USERPROFILE"
+      - name: Verify approval comment
+        shell: pwsh
+        run: |
+          $apiBase  = "${{ gitea.server_url }}/api/v1"
+          $headers  = @{ Authorization = "token ${{ gitea.token }}" }
+          $repo     = "${{ gitea.repository }}"
+          $issueNum = "${{ needs.gate.outputs.issue_number }}"
+          $approveRx = '(?i)^\s*(approve[d]?|lgtm|yes)\s*[.!]?\s*$'
+          if (-not $issueNum) { throw "Apply refused: gate did not provide an approval issue number" }
+          $comments = @(Invoke-RestMethod "$apiBase/repos/$repo/issues/$issueNum/comments" -Headers $headers)
+          $approved = $comments | Where-Object { $_.body -match $approveRx } | Select-Object -First 1
+          if (-not $approved) {
+            throw "Apply refused: issue #$issueNum has no approval comment. A successful gate job is not enough."
+          }
+          Write-Host "Approval confirmed on issue #$issueNum by $($approved.user.login)"
       # -- Checkouts ------------------------------------------------------------
       - name: Checkout config365/orchestrator
         run: git clone ${{ gitea.server_url }}/${{ vars.PLATFORM_ORG }}/orchestrator scripts

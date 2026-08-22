@@ -67,6 +67,12 @@ const Icon = {
       <path d="M4 8h8M4 11h5"/><circle cx="12" cy="6" r="1.5"/>
     </svg>
   ),
+  applocker: (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <rect x="3" y="7" width="10" height="7" rx="1"/>
+      <path d="M5 7V5a3 3 0 0 1 6 0v2"/>
+    </svg>
+  ),
   deviceCompliance: (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
       <rect x="2" y="2" width="12" height="12" rx="1.5"/>
@@ -151,7 +157,7 @@ export default function Sidebar({
   const pathname = usePathname();
   const router   = useRouter();
   const [intuneOpen, setIntuneOpen] = useState(() => {
-    return pathname.includes('/apps') || pathname.includes('/printers') || pathname.includes('/admx') || pathname.includes('/os-versions') || pathname.includes('/device-compliance');
+    return pathname.includes('/apps') || pathname.includes('/printers') || pathname.includes('/admx') || pathname.includes('/os-versions') || pathname.includes('/applocker');
   });
 
   const mspBase    = currentMspSlug ? `/msps/${currentMspSlug}` : '';
@@ -163,7 +169,7 @@ export default function Sidebar({
     return pathname.startsWith(href);
   }
 
-  const isIntuneGroup = active(`${mspBase}/apps`) || active(`${mspBase}/printers`) || active(`${mspBase}/admx`) || active(`${mspBase}/os-versions`) || active(`${mspBase}/device-compliance`);
+  const isIntuneGroup = active(`${mspBase}/apps`) || active(`${mspBase}/printers`) || active(`${mspBase}/admx`) || active(`${mspBase}/os-versions`) || active(`${mspBase}/applocker`);
 
   return (
     <aside style={{
@@ -217,6 +223,7 @@ export default function Sidebar({
 
           <NavItem href={`${mspBase}`} active={active(`${mspBase}`)} icon={Icon.dashboard}>Dashboard</NavItem>
           <NavItem href={`${mspBase}/user-compliance`} active={active(`${mspBase}/user-compliance`)} icon={Icon.compliance}>User Compliance</NavItem>
+          <NavItem href={`${mspBase}/device-compliance`} active={active(`${mspBase}/device-compliance`)} icon={Icon.deviceCompliance}>Device Compliance</NavItem>
           <NavItem href={`${mspBase}/secure-score`} active={active(`${mspBase}/secure-score`)} icon={Icon.secureScore}>Secure Score</NavItem>
           <NavItem href={`${mspBase}/viewer`} active={active(`${mspBase}/viewer`)} icon={Icon.viewer}>Policy Viewer</NavItem>
           <NavItem href={`${mspBase}/baseline`} active={active(`${mspBase}/baseline`)} icon={Icon.baseline}>Baseline</NavItem>
@@ -246,14 +253,14 @@ export default function Sidebar({
               }}>{Icon.chevron}</span>
             </button>
             <div style={{
-              overflow: 'hidden', maxHeight: (intuneOpen || isIntuneGroup) ? 280 : 0,
+              overflow: 'hidden', maxHeight: (intuneOpen || isIntuneGroup) ? 360 : 0,
               transition: 'max-height 0.2s ease',
             }}>
               <NavSubItem href={`${mspBase}/apps`} active={active(`${mspBase}/apps`)} icon={Icon.apps}>Apps</NavSubItem>
               <NavSubItem href={`${mspBase}/printers`} active={active(`${mspBase}/printers`)} icon={Icon.printers}>Printers</NavSubItem>
               <NavSubItem href={`${mspBase}/admx`} active={active(`${mspBase}/admx`)} icon={Icon.admx}>ADMX Files</NavSubItem>
               <NavSubItem href={`${mspBase}/os-versions`} active={active(`${mspBase}/os-versions`)} icon={Icon.osversion}>OS Version Control</NavSubItem>
-              <NavSubItem href={`${mspBase}/device-compliance`} active={active(`${mspBase}/device-compliance`)} icon={Icon.deviceCompliance}>Device Compliance</NavSubItem>
+              <NavSubItem href={`${mspBase}/applocker`} active={active(`${mspBase}/applocker`)} icon={Icon.applocker}>AppLocker</NavSubItem>
             </div>
           </div>
 

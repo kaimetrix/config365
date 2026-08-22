@@ -107,7 +107,7 @@ Apply a platform update by pointing App Service at the new public GHCR image and
 Configure GitHub Actions on your fork with OIDC secrets (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`) and variables (`APP_NAME`, `RESOURCE_GROUP`). Merging a platform upstream release triggers `.github/workflows/deploy.yml`, which runs:
 
 ```bash
-az webapp config container set --docker-custom-image-name ghcr.io/potsolutions/config365-preview:VERSION
+az webapp config container set --docker-custom-image-name ghcr.io/potsolutions/config365:VERSION
 az webapp restart
 ```
 
@@ -183,8 +183,8 @@ Production Azure deployments use sharded host mode, not docker job mode.
 
 Production partners run Config365 on **Azure Linux App Service**. The fork deploy workflow updates the container image on platform releases only (2nd digit of `VERSION`).
 
-1. **Fork** [potsolutions/config365-preview](https://github.com/potsolutions/config365-preview) (or GA repo).
-2. Provision a **Linux Web App** (custom container) pointing at `ghcr.io/potsolutions/config365-preview:latest` (or your chosen tag).
+1. **Fork** [potsolutions/config365](https://github.com/potsolutions/config365) (or the preview repo).
+2. Provision a **Linux Web App** (custom container) pointing at `ghcr.io/potsolutions/config365:latest` (or your chosen tag).
 3. Install the [**Pull** GitHub App](https://github.com/apps/pull) on your fork.
 4. Configure GitHub **secrets** and **variables** on the fork:
 
@@ -193,7 +193,7 @@ Production partners run Config365 on **Azure Linux App Service**. The fork deplo
    | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | OIDC login for deploy workflow |
    | `APP_NAME` | Azure Web App name |
    | `RESOURCE_GROUP` | Resource group name |
-   | `GHCR_IMAGE` (optional) | Default `ghcr.io/potsolutions/config365-preview`; use `ghcr.io/potsolutions/config365` for GA |
+   | `GHCR_IMAGE` (optional) | Default `ghcr.io/potsolutions/config365`; use `ghcr.io/potsolutions/config365-preview` for preview |
 
 5. On each upstream release, Pull opens a **PR** — **review and merge manually**.
 6. `.github/workflows/deploy.yml` runs on `push` to `main`:

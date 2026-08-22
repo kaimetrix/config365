@@ -69,6 +69,7 @@ export interface DeviceComplianceRow {
   mdeOnboardingStatus: string | null;
   mdeLastSeen: string | null;
   mdeRbacGroupName: string | null;
+  azureADDeviceId: string | null;
   primaryUser: string | null;
   lastSync: string | null;
   inMde: boolean;
@@ -149,6 +150,7 @@ function applyMdeEnrichment(row: DeviceComplianceRow, mde: MdeDeviceRecord): Dev
     mdeOnboardingStatus: mde.onboardingStatus ?? null,
     mdeLastSeen: mde.lastSeen ?? null,
     mdeRbacGroupName: mde.rbacGroupName ?? null,
+    azureADDeviceId: row.azureADDeviceId ?? mde.aadDeviceId?.toLowerCase() ?? null,
     primaryUser: row.primaryUser ?? mdePrimaryUser(mde),
     lastSync: row.lastSync ?? mde.lastSeen ?? null,
     inMde: true,
@@ -227,6 +229,7 @@ export function mergeDeviceComplianceData(
       mdeOnboardingStatus: null,
       mdeLastSeen: null,
       mdeRbacGroupName: null,
+      azureADDeviceId: aadKey || null,
       primaryUser: md.userPrincipalName ?? md.userDisplayName ?? null,
       lastSync: md.lastSyncDateTime ?? mamReg?.lastSyncDateTime ?? null,
       inMde: !!mdeMatch,
@@ -265,6 +268,7 @@ export function mergeDeviceComplianceData(
       mdeOnboardingStatus: null,
       mdeLastSeen: null,
       mdeRbacGroupName: null,
+      azureADDeviceId: aadKey || null,
       primaryUser: null,
       lastSync: reg.lastSyncDateTime ?? reg.createdDateTime ?? null,
       inMde: !!mdeDevice,
@@ -312,6 +316,7 @@ export function mergeDeviceComplianceData(
       mdeOnboardingStatus: mdeDevice.onboardingStatus ?? null,
       mdeLastSeen: mdeDevice.lastSeen ?? null,
       mdeRbacGroupName: mdeDevice.rbacGroupName ?? null,
+      azureADDeviceId: aadKey || null,
       primaryUser: mdePrimaryUser(mdeDevice),
       lastSync: mdeDevice.lastSeen ?? null,
       inMde: true,

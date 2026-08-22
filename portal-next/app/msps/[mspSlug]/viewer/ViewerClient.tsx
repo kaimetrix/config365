@@ -25,12 +25,15 @@ import {
 interface Props {
   mspSlug: string;
   tenants: Tenant[];
-  tree: TreeEntry[];
-  baselinePaths?: string[];
-  selectedTenantSlug?: string;
-  scope: string;
-  giteaOrg: string;
-  repo: string;
+  initialTenantSlug?: string;
+  initialScope?: string;
+}
+
+type CachedViewerTree = { tree: TreeEntry[]; baselinePaths: string[] };
+const viewerTreeSessionCache = new Map<string, CachedViewerTree>();
+
+function viewerTreeCacheKey(mspSlug: string, scope: string, tenant?: string) {
+  return scope === 'baseline' ? `${mspSlug}:baseline` : `${mspSlug}:tenant:${tenant ?? ''}`;
 }
 
 type ViewerTreeEntry = TreeEntry & { baselineOnly?: boolean };
@@ -152,6 +155,11 @@ function readStoredFilePanelWidth(): number {
 const CONTENT_SEARCH_DEBOUNCE_MS = 350;
 const CONTENT_SEARCH_BATCH = 10;
 const CONTENT_SEARCHABLE_FILE = /\.(json|ps1|sh)$/i;
+const TENANT_ROOT_FILES = new Set(['.baseline-ignore']);
+
+function isTenantRootFile(path: string): boolean {
+  return TENANT_ROOT_FILES.has(path);
+}
 
 function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase();
@@ -219,6 +227,9 @@ function buildTree(entries: ViewerTreeEntry[]): TreeNode[] {
 
   function sort(nodes: TreeNode[]): TreeNode[] {
     nodes.sort((a, b) => {
+      const aRoot = isTenantRootFile(a.path);
+      const bRoot = isTenantRootFile(b.path);
+      if (aRoot !== bRoot) return aRoot ? -1 : 1;
       if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
@@ -507,10 +518,14 @@ function MonitorPanel({ filePath, mspSlug, fileState, folderState, fileSha, fold
 
 /* ── Component ───────────────────────────────────────────── */
 
-export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [], selectedTenantSlug, scope, giteaOrg, repo }: Props) {
+export default function ViewerClient({ mspSlug, tenants, initialTenantSlug, initialScope = 'tenant' }: Props) {
   const router = useRouter();
-  const [treeLoading, setTreeLoading] = useState(false);
-  const pendingNavRef = useRef<{ scope: string; tenant?: string } | null>(null);
+  const [scope, setScope] = useState(initialScope);
+  const [selectedTenantSlug, setSelectedTenantSlug] = useState<string | undefined>(initialTenantSlug);
+  const [tree, setTree] = useState<TreeEntry[]>([]);
+  const [baselinePaths, setBaselinePaths] = useState<string[]>([]);
+  const [treeLoading, setTreeLoading] = useState(initialScope === 'baseline' || Boolean(initialTenantSlug));
+  const loadFileGenRef = useRef(0);
 
   const [selectedFile, setSelectedFile]           = useState<string | null>(null);
   const [content, setContent]                     = useState('');
@@ -520,6 +535,8 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
   const [error, setError]                         = useState('');
   const [success, setSuccess]                     = useState('');
   const [copying, setCopying]                     = useState(false);
+  const [savingIgnore, setSavingIgnore]           = useState(false);
+  const [ignoreSavedContent, setIgnoreSavedContent] = useState('');
   const [triggering, setTriggering]               = useState(false);
   const [expandedDirs, setExpandedDirs]           = useState<Set<string>>(new Set());
   const [tenantSearch, setTenantSearch]           = useState('');
@@ -610,6 +627,53 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
   const [fileSidecarSha, setFileSidecarSha]         = useState<string | undefined>();
   const [folderSidecarSha, setFolderSidecarSha]     = useState<string | undefined>();
 
+  useEffect(() => {
+    if (scope !== 'baseline' && !selectedTenantSlug) {
+      setTree([]);
+      setBaselinePaths([]);
+      setTreeLoading(false);
+      return;
+    }
+
+    const cacheKey = viewerTreeCacheKey(mspSlug, scope, selectedTenantSlug);
+    const cached = viewerTreeSessionCache.get(cacheKey);
+    if (cached) {
+      setTree(cached.tree);
+      setBaselinePaths(cached.baselinePaths);
+      setTreeLoading(false);
+    } else {
+      setTree([]);
+      setBaselinePaths([]);
+      setTreeLoading(true);
+    }
+
+    const controller = new AbortController();
+    const qs = scope === 'baseline'
+      ? `scope=baseline&mspSlug=${encodeURIComponent(mspSlug)}`
+      : `scope=tenant&mspSlug=${encodeURIComponent(mspSlug)}&slug=${encodeURIComponent(selectedTenantSlug ?? '')}`;
+
+    fetch(`/api/git/viewer-tree?${qs}`, { signal: controller.signal })
+      .then(async r => {
+        const data = await r.json() as { tree?: TreeEntry[]; baselinePaths?: string[]; error?: string };
+        if (!r.ok) throw new Error(data.error ?? 'Failed to load files');
+        const next: CachedViewerTree = { tree: data.tree ?? [], baselinePaths: data.baselinePaths ?? [] };
+        viewerTreeSessionCache.set(cacheKey, next);
+        setTree(next.tree);
+        setBaselinePaths(next.baselinePaths);
+        setTreeLoading(false);
+      })
+      .catch((err: Error) => {
+        if (err.name === 'AbortError') return;
+        if (!cached) {
+          setTree([]);
+          setBaselinePaths([]);
+        }
+        setTreeLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [scope, selectedTenantSlug, mspSlug]);
+
   const displayTree = useMemo((): ViewerTreeEntry[] => {
     if (scope === 'baseline' || baselinePaths.length === 0) return tree;
     const tenantPaths = new Set(tree.map(e => e.path));
@@ -660,7 +724,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
   const treeNodes = buildTree(filteredDisplayTree);
 
   const repoFilePath = useCallback((filePath: string) => {
-    if (scope !== 'baseline') return `backups/${filePath}`;
+    if (scope !== 'baseline') return isTenantRootFile(filePath) ? filePath : `backups/${filePath}`;
     return `baseline/${filePath}`;
   }, [scope]);
 
@@ -686,7 +750,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
     const generation = ++contentSearchGenRef.current;
     const controller = new AbortController();
     const candidates = displayTree.filter(
-      e => e.type === 'file' && CONTENT_SEARCHABLE_FILE.test(e.name),
+      e => e.type === 'file' && (CONTENT_SEARCHABLE_FILE.test(e.name) || isTenantRootFile(e.path)),
     );
     const toScan = candidates.filter(
       e => !pathMatchesFilename(e.path, e.name, debouncedSearchNorm),
@@ -889,6 +953,8 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
   /* ── File loading ─────────────────────────────────────── */
 
   async function loadFile(filePath: string) {
+    const gen = ++loadFileGenRef.current;
+    const stillCurrent = () => gen === loadFileGenRef.current;
     setSelectedFile(filePath);
     setContent('');
     setSha(undefined);
@@ -907,11 +973,15 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
     setScriptContent(null);
     setBaselineScript(null);
     setScriptDiffers(false);
+    setSavingIgnore(false);
+    setIgnoreSavedContent('');
     setLoading(true);
     try {
       if (filePath === REMEDIATION_PATH && scope !== 'baseline') {
         await loadMonitorSidecars(filePath);
+        if (!stillCurrent()) return;
         const snap = await fetchMailboxAuditDriftSnapshot();
+        if (!stillCurrent()) return;
         if (snap) {
           setBaselineContent(JSON.stringify(snap.remediation, null, 2));
           setContent(JSON.stringify({
@@ -925,20 +995,35 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
         }
       }
 
-      // filePath is the backup-root-relative path (backups/ prefix already stripped).
-      // The tenant repo stores files under backups/, so re-add the prefix for that fetch.
-      // The baseline repo stores policy files under baseline/, added back when fetching below.
-      const tenantPath = scope !== 'baseline' ? `backups/${filePath}` : filePath;
+      // filePath is the backup-root-relative path (backups/ prefix already stripped),
+      // except tenant-root files such as .baseline-ignore which live at the repo root.
+      const tenantPath = scope !== 'baseline'
+        ? (isTenantRootFile(filePath) ? filePath : `backups/${filePath}`)
+        : filePath;
       const qscope = scope === 'baseline' ? 'baseline' : 'tenant';
       const qslug  = scope !== 'baseline' ? `&slug=${selectedTenantSlug}` : `&mspSlug=${mspSlug}`;
       const res    = await fetch(`/api/git/file?path=${encodeURIComponent(tenantPath)}&scope=${qscope}${qslug}`);
       const data   = await res.json();
+      if (!stillCurrent()) return;
       if (!res.ok) throw new Error(data.error);
-      setContent(data.exists ? data.content : '(file not found)');
+      setContent(data.exists
+        ? data.content
+        : isTenantRootFile(filePath)
+          ? '# This tenant has no .baseline-ignore yet.\n# One glob pattern per line, e.g.\n# intune/device-configurations/Some Policy.json\n'
+          : '(file not found)');
       setSha(data.exists ? data.sha : undefined);
+
+      if (isTenantRootFile(filePath)) {
+        setMonitorConfig(null);
+        setIgnoreSavedContent(data.exists
+          ? data.content
+          : '# This tenant has no .baseline-ignore yet.\n# One glob pattern per line, e.g.\n# intune/device-configurations/Some Policy.json\n');
+        return;
+      }
 
       // Load monitor sidecar from baseline (applies to both modes)
       const mergedConfig = await loadMonitorSidecars(filePath);
+      if (!stillCurrent()) return;
 
       if (scope !== 'baseline') {
         try {
@@ -946,6 +1031,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
           const baselinePath = `baseline/${filePath}`;
           const br = await fetch(`/api/git/file?path=${encodeURIComponent(baselinePath)}&scope=baseline&mspSlug=${mspSlug}`);
           const bd = await br.json();
+          if (!stillCurrent()) return;
           if (br.ok && bd.exists) {
             setBaselineContent(bd.content);
             // Update diffMap with monitor-config-aware comparison for this file
@@ -959,7 +1045,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
           } else {
             setBaselineContent(null);
           }
-        } catch { setBaselineContent(null); }
+        } catch { if (stillCurrent()) setBaselineContent(null); }
       }
 
       // Suppress unused variable warning — mergedConfig is used in isDiff below via monitorConfig state
@@ -977,6 +1063,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
             fetch(tnScriptUrl).then(r => r.json()).catch(() => ({ exists: false })),
             fetch(blScriptUrl).then(r => r.json()).catch(() => ({ exists: false })),
           ]);
+          if (!stillCurrent()) return;
           const norm = (s: string) => s.replace(/\r\n/g, '\n').trimEnd();
           const tnText = tnScr.exists ? (tnScr.content as string) : null;
           const blText = blScr.exists ? (blScr.content as string) : null;
@@ -987,8 +1074,44 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
           }
         } catch { /* non-fatal — script tab just won't show */ }
       }
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : 'Error'); }
-    finally { setLoading(false); }
+    } catch (e: unknown) {
+      if (stillCurrent()) setError(e instanceof Error ? e.message : 'Error');
+    } finally {
+      if (stillCurrent()) setLoading(false);
+    }
+  }
+
+  async function saveTenantRootFile() {
+    if (!selectedFile || !isTenantRootFile(selectedFile) || !selectedTenantSlug) return;
+    setSavingIgnore(true);
+    setError('');
+    setSuccess('');
+    try {
+      const body = content.endsWith('\n') ? content : `${content}\n`;
+      const res = await fetch('/api/git/file', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slug: selectedTenantSlug,
+          path: selectedFile,
+          content: body,
+          sha: sha || undefined,
+          message: `portal: update ${selectedFile}`,
+        }),
+      });
+      const data = await res.json() as { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Save failed');
+      setContent(body);
+      setIgnoreSavedContent(body);
+      const check = await fetch(`/api/git/file?slug=${encodeURIComponent(selectedTenantSlug)}&path=${encodeURIComponent(selectedFile)}`);
+      const saved = await check.json() as { sha?: string };
+      if (saved.sha) setSha(saved.sha);
+      setSuccess('Saved .baseline-ignore.');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Save failed');
+    } finally {
+      setSavingIgnore(false);
+    }
   }
 
   /* ── Sidecar write helper ─────────────────────────────── */
@@ -1192,6 +1315,31 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
 
   /* ── Navigation / misc ────────────────────────────────── */
 
+  function resetContentPanel() {
+    loadFileGenRef.current += 1;
+    setSelectedFile(null);
+    setContent('');
+    setSha(undefined);
+    setBaselineContent(null);
+    setError('');
+    setSuccess('');
+    setShowDiff(false);
+    setSelectedPaths(new Set());
+    setScopeDropdownOpen(false);
+    setMonitorConfig(null);
+    setFileMonitorState({ include: [], exclude: [] });
+    setFolderMonitorState({ include: [], exclude: [] });
+    setFileSidecarSha(undefined);
+    setFolderSidecarSha(undefined);
+    setActiveTab('json');
+    setScriptContent(null);
+    setBaselineScript(null);
+    setScriptDiffers(false);
+    setSavingIgnore(false);
+    setIgnoreSavedContent('');
+    setLoading(false);
+  }
+
   function navigate(newScope: string, newTenant?: string) {
     const alreadyHere =
       newScope === 'baseline'
@@ -1199,26 +1347,30 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
         : scope === 'tenant' && selectedTenantSlug === newTenant;
     if (alreadyHere) return;
 
+    setScope(newScope);
+    setSelectedTenantSlug(newTenant);
     setDiffMap(new Map());
     setFileFilter('all');
-    pendingNavRef.current = { scope: newScope, tenant: newTenant };
-    setTreeLoading(true);
+    resetContentPanel();
     const base = `/msps/${mspSlug}/viewer?scope=${newScope}`;
-    router.push(newTenant ? `${base}&tenant=${newTenant}` : base);
+    router.replace(newTenant ? `${base}&tenant=${newTenant}` : base);
   }
 
+  const urlScopeRef = useRef({ scope: initialScope, tenant: initialTenantSlug });
   useEffect(() => {
-    const pending = pendingNavRef.current;
-    if (!pending) return;
-    const arrived =
-      pending.scope === 'baseline'
-        ? scope === 'baseline'
-        : scope === 'tenant' && selectedTenantSlug === pending.tenant;
-    if (arrived) {
-      pendingNavRef.current = null;
-      setTreeLoading(false);
+    const nextScope = initialScope ?? 'tenant';
+    if (nextScope === scope && initialTenantSlug === selectedTenantSlug) {
+      urlScopeRef.current = { scope: initialScope, tenant: initialTenantSlug };
+      return;
     }
-  }, [selectedTenantSlug, scope, tree]);
+    if (urlScopeRef.current.scope === initialScope && urlScopeRef.current.tenant === initialTenantSlug) return;
+    urlScopeRef.current = { scope: initialScope, tenant: initialTenantSlug };
+    setScope(nextScope);
+    setSelectedTenantSlug(initialTenantSlug);
+    setDiffMap(new Map());
+    setFileFilter('all');
+    resetContentPanel();
+  }, [initialScope, initialTenantSlug, scope, selectedTenantSlug]);
 
   async function triggerDeploy() {
     if (!selectedTenantSlug) return;
@@ -1394,7 +1546,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
       );
     }
 
-    if (fileFilter === 'conflicts' && diffMap.get(node.path) !== true) return null;
+    if (fileFilter === 'conflicts' && !isTenantRootFile(node.path) && diffMap.get(node.path) !== true) return null;
 
     const active    = selectedFile === node.path;
     const svc       = classifyService(node.path);
@@ -1419,6 +1571,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
         <span title={node.path} style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: '0.78rem' }}>{node.name}</span>
         {hasDiff && <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', flexShrink: 0 }} title="Differs from baseline" />}
         {node.baselineOnly && <span style={{ fontSize: '0.6rem', color: '#c084fc', background: 'rgba(192,132,252,0.1)', border: '1px solid rgba(192,132,252,0.25)', borderRadius: 3, padding: '0 3px', flexShrink: 0 }}>baseline</span>}
+        {isTenantRootFile(node.path) && <span style={{ fontSize: '0.6rem', color: '#f97316', background: 'rgba(249,115,22,0.12)', border: '1px solid rgba(249,115,22,0.3)', borderRadius: 3, padding: '0 3px', flexShrink: 0 }}>IGN</span>}
         {node.name.endsWith('.assignment.json') && <span style={{ fontSize: '0.6rem', color: '#60a5fa', background: 'rgba(96,165,250,0.1)', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 3, padding: '0 3px', flexShrink: 0 }}>ASN</span>}
         {!node.name.endsWith('.assignment.json') && node.name.endsWith('.json') && <span style={{ fontSize: '0.6rem', color: '#3f3f46', flexShrink: 0 }}>JSON</span>}
       </div>
@@ -1645,8 +1798,11 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
           {/* File path */}
           {selectedFile ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
-              {scope !== 'baseline' && (
+              {scope !== 'baseline' && selectedFile && !isTenantRootFile(selectedFile) && (
                 <span style={{ flexShrink: 0, fontSize: '0.65rem', fontWeight: 600, color: '#a16207', background: 'rgba(234,179,8,0.12)', border: '1px solid rgba(234,179,8,0.2)', borderRadius: 4, padding: '1px 6px', fontFamily: 'monospace' }}>backups/</span>
+              )}
+              {scope !== 'baseline' && selectedFile && isTenantRootFile(selectedFile) && (
+                <span style={{ flexShrink: 0, fontSize: '0.65rem', fontWeight: 600, color: '#ea580c', background: 'rgba(249,115,22,0.12)', border: '1px solid rgba(249,115,22,0.25)', borderRadius: 4, padding: '1px 6px', fontFamily: 'monospace' }}>tenant/</span>
               )}
               <code style={{ fontSize: '0.78rem', color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{selectedFile}</code>
             </div>
@@ -1726,7 +1882,24 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
               </button>
             )}
 
-            {scope !== 'baseline' && selectedFile && !hasSelection && (
+            {scope !== 'baseline' && selectedFile && isTenantRootFile(selectedFile) && (
+              <button
+                type="button"
+                onClick={() => void saveTenantRootFile()}
+                disabled={savingIgnore || !selectedTenantSlug || content === ignoreSavedContent}
+                style={{
+                  padding: '5px 12px', fontSize: '0.75rem', fontWeight: 600, fontFamily: 'inherit',
+                  background: content !== ignoreSavedContent ? 'rgba(34,197,94,0.15)' : '#18181b',
+                  border: `1px solid ${content !== ignoreSavedContent ? '#22c55e' : '#27272a'}`,
+                  color: content !== ignoreSavedContent ? '#22c55e' : '#71717a',
+                  borderRadius: 5,
+                  cursor: savingIgnore || content === ignoreSavedContent ? 'not-allowed' : 'pointer',
+                  opacity: savingIgnore ? 0.6 : 1,
+                }}
+              >{savingIgnore ? 'Saving…' : 'Save'}</button>
+            )}
+
+            {scope !== 'baseline' && selectedFile && !hasSelection && !isTenantRootFile(selectedFile) && (
               <button
                 onClick={copyToBaseline} disabled={copying}
                 style={{ padding: '5px 10px', fontSize: '0.75rem', fontWeight: 600, background: '#18181b', border: '1px solid #27272a', color: '#71717a', borderRadius: 5, cursor: copying ? 'not-allowed' : 'pointer', fontFamily: 'inherit', opacity: copying ? 0.5 : 1 }}
@@ -1743,9 +1916,14 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
         </div>
 
         {/* Field selection hint */}
-        {selectedFile && !loading && content && content !== '(file not found)' && !hasSelection && (
+        {selectedFile && !loading && content && content !== '(file not found)' && !hasSelection && !isTenantRootFile(selectedFile) && (
           <div style={{ padding: '3px 16px', flexShrink: 0, fontSize: '0.7rem', color: '#3f3f46' }}>
             Click JSON lines to select fields — monitoring rules are saved to the <span style={{ color: '#52525b' }}>baseline</span> and apply to all tenants
+          </div>
+        )}
+        {selectedFile && !loading && isTenantRootFile(selectedFile) && (
+          <div style={{ padding: '3px 16px', flexShrink: 0, fontSize: '0.7rem', color: '#71717a' }}>
+            Edit and Save. One glob per line. Policies listed here are skipped on plan and deploy.
           </div>
         )}
         {hasSelection && (
@@ -1781,7 +1959,7 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
         <div style={{ flex: 1, overflow: 'auto', padding: 0 }}>
 
           {/* Field monitoring panel — inside scroll area, above JSON (matches legacy design) */}
-          {selectedFile && !loading && content && content !== '(file not found)' && (
+          {selectedFile && !loading && content && content !== '(file not found)' && !isTenantRootFile(selectedFile) && (
             <MonitorPanel
               filePath={selectedFile}
               mspSlug={mspSlug}
@@ -1826,7 +2004,28 @@ export default function ViewerClient({ mspSlug, tenants, tree, baselinePaths = [
             </div>
           )}
 
-          {selectedFile && !loading && activeTab === 'json' && !showDiff && content && renderAnnotatedJson(content)}
+          {selectedFile && !loading && isTenantRootFile(selectedFile) && (
+            <textarea
+              value={content}
+              onChange={e => { setContent(e.target.value); setSuccess(''); }}
+              onKeyDown={e => {
+                if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+                  e.preventDefault();
+                  if (content !== ignoreSavedContent && !savingIgnore) void saveTenantRootFile();
+                }
+              }}
+              spellCheck={false}
+              style={{
+                width: '100%', height: '100%', minHeight: 360, boxSizing: 'border-box',
+                margin: 0, padding: '12px 16px', resize: 'none',
+                background: 'transparent', border: 'none', outline: 'none',
+                color: '#d4d4d8', fontSize: '0.78rem', lineHeight: 1.6,
+                fontFamily: "'JetBrains Mono', Consolas, monospace",
+              }}
+            />
+          )}
+
+          {selectedFile && !loading && activeTab === 'json' && !showDiff && content && !isTenantRootFile(selectedFile) && renderAnnotatedJson(content)}
 
           {selectedFile && !loading && activeTab === 'json' && showDiff && isDiff && (
             <div style={{ overflow: 'auto' }}>

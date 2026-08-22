@@ -367,6 +367,90 @@ function Get-OmaSettingsWithPlainText {
     return $result
 }
 
+function Get-AppLockerXmlChild {
+    param($Parent, [string]$LocalName)
+    if (-not $Parent) { return $null }
+    foreach ($c in @($Parent.ChildNodes)) {
+        if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element -and $c.LocalName -eq $LocalName) {
+            return $c
+        }
+    }
+    return $null
+}
+
+function Get-AppLockerConditionSignature {
+    param($Node)
+    if (-not $Node) { return '' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($c in @($Node.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element })) {
+        $kind = $c.LocalName
+        if ($kind -eq 'FilePathCondition') {
+            $parts.Add("path:$($c.GetAttribute('Path'))")
+        } elseif ($kind -eq 'FilePublisherCondition') {
+            $ver = Get-AppLockerXmlChild -Parent $c -LocalName 'BinaryVersionRange'
+            $low = if ($ver) { $ver.GetAttribute('LowSection') } else { '*' }
+            $high = if ($ver) { $ver.GetAttribute('HighSection') } else { '*' }
+            $parts.Add("pub:$($c.GetAttribute('PublisherName'))|$($c.GetAttribute('ProductName'))|$($c.GetAttribute('BinaryName'))|$low|$high")
+        } elseif ($kind -eq 'FileHashCondition') {
+            foreach ($h in @($c.ChildNodes | Where-Object { $_.LocalName -eq 'FileHash' })) {
+                $parts.Add("hash:$($h.GetAttribute('Data'))")
+            }
+        } else {
+            $parts.Add("$kind")
+        }
+    }
+    return (($parts | Sort-Object) -join ';')
+}
+
+function Get-AppLockerRuleSignature {
+    param($Node)
+    $id = ([string]$Node.GetAttribute('Id')).ToLowerInvariant()
+    $conds = Get-AppLockerConditionSignature -Node (Get-AppLockerXmlChild -Parent $Node -LocalName 'Conditions')
+    $excs = Get-AppLockerConditionSignature -Node (Get-AppLockerXmlChild -Parent $Node -LocalName 'Exceptions')
+    return @(
+        $Node.LocalName
+        $id
+        [string]$Node.GetAttribute('Name')
+        [string]$Node.GetAttribute('Action')
+        [string]$Node.GetAttribute('UserOrGroupSid')
+        ([string]$Node.GetAttribute('Description')).Trim()
+        $conds
+        $excs
+    ) -join '|'
+}
+
+function ConvertTo-OmaString {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return $Value }
+    if ($Value.PSObject.Properties['value']) { return [string]$Value.value }
+    return [string]$Value
+}
+
+function Get-AppLockerOmaValueCanonical {
+    param($Value)
+    $text = ConvertTo-OmaString -Value $Value
+    if ($text -isnot [string] -or $text -notmatch 'RuleCollection') { return $text }
+    $text = $text.Trim().TrimStart([char]0xFEFF)
+    try {
+        $doc = [xml]$text
+        $root = $doc.DocumentElement
+        if (-not $root -or $root.LocalName -ne 'RuleCollection') {
+            $root = $doc.SelectSingleNode('//RuleCollection')
+        }
+        if (-not $root) { return $text }
+        $rules = @($root.ChildNodes | Where-Object {
+            $_.NodeType -eq [System.Xml.XmlNodeType]::Element
+        })
+        $sigs = @($rules | ForEach-Object { Get-AppLockerRuleSignature $_ } | Sort-Object)
+        $type = $root.GetAttribute('Type').ToLowerInvariant()
+        $mode = $root.GetAttribute('EnforcementMode').ToLowerInvariant()
+        return "$type|$mode|$($sigs -join '`n')"
+    } catch {
+        return $text
+    }
+}
+
 function Compare-OmaSettings {
     <#
     .SYNOPSIS
@@ -461,17 +545,23 @@ function Compare-OmaSettings {
             $differences += "~ $settingName displayName: '$($matching.displayName)' â†’ '$($desired.displayName)'"
         }
         
-        if ($matching.value -ne $desired.value) {
-            # Truncate long values for display
-            $existingVal = if ($matching.value.Length -gt 80) { $matching.value.Substring(0, 77) + "..." } else { $matching.value }
-            $desiredVal = if ($desired.value.Length -gt 80) { $desired.value.Substring(0, 77) + "..." } else { $desired.value }
+        $existingOmaValue = Get-AppLockerOmaValueCanonical -Value $matching.value
+        $desiredOmaValue  = Get-AppLockerOmaValueCanonical -Value $desired.value
+        if ($existingOmaValue -ne $desiredOmaValue) {
+            $existingVal = [string](ConvertTo-OmaString -Value $matching.value)
+            $desiredVal = [string](ConvertTo-OmaString -Value $desired.value)
+            if ($existingVal.Length -gt 80) { $existingVal = $existingVal.Substring(0, 77) + "..." }
+            if ($desiredVal.Length -gt 80) { $desiredVal = $desiredVal.Substring(0, 77) + "..." }
             $differences += "~ $settingName value:"
             $differences += "    FROM: $existingVal"
             $differences += "    TO:   $desiredVal"
         }
-        
-        if ($matching.'@odata.type' -ne $desired.'@odata.type') {
-            $differences += "~ $settingName type: '$($matching.'@odata.type')' â†’ '$($desired.'@odata.type')'"
+
+        $isAppLockerUri = [string]$desired.omaUri -match 'AppLocker'
+        $existingType = [string]$matching.'@odata.type'
+        $desiredType = [string]$desired.'@odata.type'
+        if (-not $isAppLockerUri -and $existingType -and $desiredType -and $existingType -ne $desiredType) {
+            $differences += "~ $settingName type: '$existingType' → '$desiredType'"
         }
     }
     
@@ -544,6 +634,7 @@ function Invoke-DeviceConfigurations {
                 # Only compare properties explicitly defined in the baseline for these policy types
                 $requiresOnlyDesiredKeyComparison = $policyConfig.'@odata.type' -in @(
                     '#microsoft.graph.windows10GeneralConfiguration',
+                    '#microsoft.graph.windows10CustomConfiguration',
                     '#microsoft.graph.androidDeviceOwnerGeneralDeviceConfiguration'
                 )
                 

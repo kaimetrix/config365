@@ -1,7 +1,7 @@
 /**
  * GET /api/tenants/[slug]/group-membership?groupName=<safeFileName>
  *
- * Returns the backed-up user member IDs for a given security group.
+ * Returns backed-up user and device members for a security group.
  * Data comes from backups/group-membership/{groupName}.json in the tenant repo.
  * No live Graph calls.
  */
@@ -22,12 +22,20 @@ interface MemberEntry {
   displayName: string;
 }
 
+interface DeviceMemberEntry {
+  id?: string;
+  deviceId?: string;
+  displayName?: string;
+}
+
 interface GroupMembershipBackup {
   groupDisplayName: string;
   groupId: string;
   backedUpAt: string;
   memberCount: number;
   members: MemberEntry[];
+  deviceMemberCount?: number;
+  deviceMembers?: DeviceMemberEntry[];
 }
 
 function toSafeFileName(name: string): string {
@@ -36,6 +44,12 @@ function toSafeFileName(name: string): string {
   // Only the listed special chars are replaced; spaces and hyphens are preserved as-is.
   return name.replace(/[\\/:*?"<>|[\]]/g, '_');
 }
+
+const EMPTY = {
+  memberIds: [] as string[],
+  memberUpns: [] as string[],
+  deviceIds: [] as string[],
+};
 
 export async function GET(
   request: NextRequest,
@@ -61,15 +75,29 @@ export async function GET(
 
   const result = await getFile(org, repo, path);
   if (!result.exists) {
-    // Backup hasn't run yet or group has no membership file
-    return json({ memberIds: [], notBacked: true });
+    return json({ ...EMPTY, notBacked: true });
   }
 
   try {
     const data = JSON.parse(result.content) as GroupMembershipBackup;
-    const memberIds = (data.members ?? []).map((m) => m.id).filter(Boolean);
-    return json({ memberIds, backedUpAt: data.backedUpAt ?? null });
+    const members = data.members ?? [];
+    const memberIds = members.map((m) => m.id).filter(Boolean);
+    const memberUpns = members
+      .map((m) => m.userPrincipalName?.trim().toLowerCase())
+      .filter((upn): upn is string => !!upn);
+    const hasDeviceMembersField = Array.isArray(data.deviceMembers);
+    const deviceIds = (data.deviceMembers ?? [])
+      .flatMap((d) => [d.deviceId, d.id])
+      .map((id) => id?.trim().toLowerCase())
+      .filter((id): id is string => !!id);
+    return json({
+      memberIds,
+      memberUpns,
+      deviceIds,
+      deviceMembersMissing: !hasDeviceMembersField,
+      backedUpAt: data.backedUpAt ?? null,
+    });
   } catch {
-    return json({ memberIds: [], error: 'Failed to parse membership backup' });
+    return json({ ...EMPTY, error: 'Failed to parse membership backup' });
   }
 }
