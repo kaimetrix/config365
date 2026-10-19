@@ -36,7 +36,7 @@
     "server-only": "^0.0.1",
     "swr": "^2.2.0",
     "tailwind-merge": "^2.4.0",
-    "tailwindcss": "^3.4.0"
+    "tailwindcss": "^4.3.3"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",
